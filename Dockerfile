@@ -1,6 +1,9 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 # Install Node.js 20 for the WhatsApp bridge
+# Use Chinese mirror for faster apt
+RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git bubblewrap openssh-client && \
     mkdir -p /etc/apt/keyrings && \
