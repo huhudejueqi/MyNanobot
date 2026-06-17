@@ -138,43 +138,53 @@ class TurnContext:
 
 
 class AgentLoop:
-    """
-    The agent loop is the core processing engine.
+    """AgentLoop 是 nanobot 的核心处理引擎。
 
-    It:
-    1. Receives messages from the bus
-    2. Builds context with history, memory, skills
-    3. Calls the LLM
-    4. Executes tool calls
-    5. Sends responses back
+    职责：
+    1. 从消息总线接收用户消息
+    2. 构建上下文（含历史记录、记忆、技能）
+    3. 调用 LLM 获取回复
+    4. 执行工具调用
+    5. 将响应发送回对应频道
     """
 
     @property
     def current_iteration(self) -> int:
+        """返回当前轮次的迭代次数。"""
         return self._current_iteration
 
     @property
     def tool_names(self) -> list[str]:
+        """返回已注册的工具名称列表。"""
         return self.tools.tool_names
 
     def llm_runtime(self) -> LLMRuntime:
-        """Return the current provider/model pair owned by this loop."""
+        """返回当前 LLM provider/model 配对。"""
         self._refresh_provider_snapshot()
         return LLMRuntime(self.provider, self.model)
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
 
-    # Event-driven state transition table.
-    # Handlers return an event string; the driver looks up the next state here.
+    # 事件驱动的状态转换表。
+    # handler 返回事件字符串，driver 根据该表查找下一状态。
     _TRANSITIONS: dict[tuple[TurnState, str], TurnState] = {
+        # (当前状态, 事件) -> 下一状态
+        # 恢复会话 -> 压缩历史
         (TurnState.RESTORE, "ok"): TurnState.COMPACT,
+        # 压缩完毕 -> 处理命令
         (TurnState.COMPACT, "ok"): TurnState.COMMAND,
+        # 需分派 -> 构建上下文
         (TurnState.COMMAND, "dispatch"): TurnState.BUILD,
+        # 快捷命令 -> 直接结束
         (TurnState.COMMAND, "shortcut"): TurnState.DONE,
+        # 上下文就绪 -> 调用 LLM
         (TurnState.BUILD, "ok"): TurnState.RUN,
+        # LLM 返回 -> 保存消息
         (TurnState.RUN, "ok"): TurnState.SAVE,
+        # 消息已保存 -> 发响应
         (TurnState.SAVE, "ok"): TurnState.RESPOND,
+        # 响应已发送 -> 本轮结束
         (TurnState.RESPOND, "ok"): TurnState.DONE,
     }
 
@@ -218,16 +228,21 @@ class AgentLoop:
 
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
+        # 消息总线：负责接收和分发所有消息
         self.bus = bus
+        # 运行时事件总线（model 切换、session 变更等）
         self.runtime_events = runtime_events or RuntimeEventBus()
         self.runtime_event_publisher = RuntimeEventPublisher(self.runtime_events)
+        # 频道配置（Telegram、Discord 等）
         self.channels_config = channels_config
+        # LLM provider 和 model
         self.provider = provider
         self._provider_snapshot_loader = provider_snapshot_loader
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
         self._provider_signature = provider_signature
         self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
+        # 工作目录：存放 session、记忆、cron 等数据
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = (
@@ -249,6 +264,7 @@ class AgentLoop:
             tool_hint_max_length if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
         )
+        # 工具配置（web 搜索、文件操作、shell 执行等）
         self.tools_config = _tc
         self.web_config = _tc.web
         self.exec_config = _tc.exec
@@ -258,8 +274,10 @@ class AgentLoop:
             and "openrouter" not in self._image_generation_provider_configs
         ):
             self._image_generation_provider_configs["openrouter"] = image_generation_provider_config
+        # 定时任务服务
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        # 工作区作用域解析：控制 agent 能访问的目录范围
         self.workspace_scopes = WorkspaceScopeResolver(
             default_workspace=workspace,
             default_restrict_to_workspace=restrict_to_workspace,
@@ -268,13 +286,19 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
+        # 上下文构建器：组装历史消息、记忆、技能提示
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        # Session 管理器：按 session 保存和恢复对话历史
         self.sessions = session_manager or SessionManager(workspace)
+        # 工具注册表：所有可用工具的注册中心
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
+        # 文件读写状态追踪（每个逻辑 session 独立追踪）
         self._file_state_store = FileStateStore()
+        # Agent 运行器：负责 LLM 多轮对话循环
         self.runner = AgentRunner(provider)
+        # 子 Agent 管理器：支持 spawn 子任务并行执行
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -288,20 +312,29 @@ class AgentLoop:
             max_concurrent_subagents=max_concurrent_subagents,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
         )
+        # 统一 session：同一频道共享同一个 session
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
+        # 运行状态标志
         self._running = False
+        # MCP 服务器管理：连接、断开、重连
         self._mcp_servers = mcp_servers or {}
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
         self._mcp_connected = False
         self._mcp_connecting = False
+        # 活跃 session 任务追踪（用于中断和并发控制）
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        # 后台任务列表（如定时记忆合并）
         self._background_tasks: list[asyncio.Task] = []
+        # 每个 session 的锁，防止同一会话并发
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Per-session pending queues for mid-turn message injection.
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.
+        # 每个 session 的待处理消息队列
+        # 当 session 正在处理中，新消息先入队等待
         self._pending_queues: dict[str, asyncio.Queue] = {}
+        # Cron 任务轮次协调器
         self._cron_turns = CronTurnCoordinator(
             publish_inbound=self.bus.publish_inbound,
             dispatch=self._dispatch,
@@ -309,9 +342,11 @@ class AgentLoop:
         )
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
+        # 并发请求限制（NANOBOT_MAX_CONCURRENT_REQUESTS，默认 3）
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        # 记忆合并器（Dream）：定期将短期记忆压缩为长期记忆
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -324,11 +359,13 @@ class AgentLoop:
             consolidation_ratio=consolidation_ratio,
             unified_session=unified_session,
         )
+        # 自动历史压缩：超阈值时触发上下文压缩
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
         )
+        # Model Preset 管理：预定义的模型/供应商切换方案
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None
         if model_preset:
@@ -336,6 +373,7 @@ class AgentLoop:
         self._register_default_tools()
         self._runtime_vars: dict[str, Any] = {}
         self._current_iteration: int = 0
+        # 命令路由器：处理 /slash 命令
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
@@ -411,6 +449,7 @@ class AgentLoop:
         model = snapshot.model
         context_window_tokens = snapshot.context_window_tokens
         old_model = self.model
+        # LLM provider 和 model
         self.provider = provider
         self.model = model
         self.context_window_tokens = context_window_tokens
@@ -867,13 +906,19 @@ class AgentLoop:
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
     async def run(self) -> None:
-        """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
+        """
+        主循环：持续从总线消费消息。
+
+        每收到一条消息，创建一个 asyncio.Task 交给 _dispatch() 处理，
+        从而实现跨 session 并发、同 session 串行。
+        """
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
 
         while self._running:
             try:
+            # 从总线取消息，1s 超时（用于心跳检测和自动压缩）
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
                 self.auto_compact.check_expired(
@@ -944,6 +989,7 @@ class AgentLoop:
                     continue
             # Compute the effective session key before dispatching
             # This ensures /stop command can find tasks correctly when unified session is enabled
+            # 将消息分派到独立 Task，不阻塞主循环
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(effective_key, []).append(task)
             task.add_done_callback(
@@ -954,15 +1000,24 @@ class AgentLoop:
             )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message: per-session serial, cross-session concurrent."""
+        """
+        处理单条消息的完整流程：
+        1. 获取 session 锁（同 session 串行）
+        2. 恢复/压缩历史
+        3. 构建上下文，调用 LLM
+        4. 执行工具调用（ReAct 循环）
+        5. 保存消息并发送响应
+        """
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        # 获取 session 锁：同一 session 的消息串行执行
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 
         pending: asyncio.Queue | None = None
         try:
+        # 持有锁时执行状态机（RESTORE -> COMPACT -> ... -> DONE）
             async with lock, gate:
                 # Only the task that owns the session lock may publish the
                 # active mid-turn injection queue for this session.
@@ -1128,6 +1183,7 @@ class AgentLoop:
 
     def stop(self) -> None:
         """Stop the agent loop."""
+        # 运行状态标志
         self._running = False
         logger.info("Agent loop stopping")
 
@@ -1818,8 +1874,10 @@ class AgentLoop:
             content=content, media=media or [],
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
+        # 获取 session 锁：同一 session 的消息串行执行
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         try:
+        # 持有锁时执行状态机（RESTORE -> COMPACT -> ... -> DONE）
             async with lock:
                 kwargs: dict[str, Any] = {
                     "session_key": session_key,
