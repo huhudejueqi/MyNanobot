@@ -115,25 +115,43 @@ def _normalize_windows_stdio_command(
     args: list[str] | None,
     env: dict[str, str] | None,
 ) -> tuple[str, list[str], dict[str, str] | None]:
-    """Wrap Windows shell launchers so MCP stdio servers start reliably."""
+    """Wrap Windows shell launchers so MCP stdio servers start reliably.
+    文档注释：对Windows系统下启动MCP stdio服务的命令做包装处理，保证进程正常拉起运行
+    """
+    # 1. 处理参数列表：如果args是None，转为空列表，统一格式
     normalized_args = list(args or [])
+
+    # 2. 判断操作系统：不是Windows（nt代表Windows），直接原样返回，无需处理
     if os.name != "nt":
         return command, normalized_args, env
 
+    # 提取命令文件名（不带路径，只保留程序名，如 C:\xxx\node.exe → node）
     basename = _windows_command_basename(command)
+
+    # 3. 如果本身就是 cmd/powershell/pwsh 等系统shell，不需要包装，直接返回
     if basename in {"cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
         return command, normalized_args, env
 
+    # 4. 如果命令本身是exe/com可执行程序，原生可直接启动，不用包装
     if basename.endswith((".exe", ".com")):
         return command, normalized_args, env
 
+    # 5. 根据环境变量PATH查找命令真实完整路径；找不到就沿用原始command
     resolved = shutil.which(command, path=(env or {}).get("PATH")) or command
+    # 取出真实路径的文件名
     resolved_basename = _windows_command_basename(resolved)
+
+    # 6. 判断是否需要用shell包装启动：满足任意一条就要包装
     should_wrap = (
+        # 命令属于Windows脚本启动器
         basename in _WINDOWS_SHELL_LAUNCHERS
+        # 原始命令是 .bat/.cmd 批处理脚本
         or basename.endswith((".cmd", ".bat"))
+        # 真实解析后的命令是 .bat/.cmd 批处理脚本
         or resolved_basename.endswith((".cmd", ".bat"))
     )
+
+    # 7. 不需要包装 → 直接返回原始命令、参数、环境变量
     if not should_wrap:
         return command, normalized_args, env
 
@@ -584,6 +602,62 @@ async def connect_mcp_servers(
     Each server gets its own stack to prevent cancel scope conflicts
     when multiple MCP servers are configured.
     """
+# connect_mcp_servers(批量连接所有MCP服务)
+# ├─ 延迟导入MCP官方客户端模块
+# ├─ 内部子函数：connect_single_server(单个MCP服务连接核心逻辑)
+# │  ├─ 创建独立 AsyncExitStack 资源栈（单服务隔离资源）
+# │  ├─ 手动进入资源栈上下文
+# │  ├─ try 主连接流程
+# │  │  ├─ 步骤1：自动识别传输类型 transport_type
+# │  │  │  ├─ 配置有type → 直接使用
+# │  │  │  └─ 无type自动推断：
+# │  │  │     ├─ 有command → stdio
+# │  │  │     ├─ 有url：路径尾 /sse → sse，否则 streamableHttp
+# │  │  │     └─ 无command无url → 警告、关闭栈、返回None跳过
+# │  │  ├─ 步骤2：网络传输前置URL安全校验（sse / streamableHttp）
+# │  │  │  ├─ URL不安全 → 警告、关栈、返回None
+# │  │  ├─ 步骤3：按传输类型建立读写流 read/write
+# │  │  │  ├─ 分支1：transport_type = stdio
+# │  │  │  │  ├─ 标准化Windows启动命令/参数/环境变量
+# │  │  │  │  ├─ 组装 StdioServerParameters
+# │  │  │  │  └─ stdio_client 入栈，得到 read, write
+# │  │  │  ├─ 分支2：transport_type = sse
+# │  │  │  │  ├─ 探测URL连通性，不可达则跳过
+# │  │  │  │  ├─ 自定义httpx客户端工厂（合并请求头、URL校验钩子）
+# │  │  │  │  └─ sse_client 入栈，得到 read, write
+# │  │  │  ├─ 分支3：transport_type = streamableHttp
+# │  │  │  │  ├─ 探测URL连通性，不可达则跳过
+# │  │  │  │  ├─ 创建 httpx.AsyncClient 并入栈管理
+# │  │  │  │  └─ streamable_http_client 入栈，得到 read, write
+# │  │  │  └─ 分支4：未知传输类型 → 警告、关栈、返回None
+# │  │  ├─ 步骤4：初始化MCP ClientSession会话
+# │  │  │  ├─ ClientSession 加入资源栈托管
+# │  │  │  └─ session.initialize() 完成MCP握手
+# │  │  ├─ 步骤5：拉取并注册 Tools 工具
+# │  │  │  ├─ 获取服务全部工具列表 tools
+# │  │  │  ├─ 读取 enabled_tools 配置，判断是否允许全部工具(*)
+# │  │  │  ├─ 遍历所有工具：
+# │  │  │  │  ├─ 生成全局唯一包装名 mcp_服务名_工具名
+# │  │  │  │  ├─ 不在启用列表则跳过
+# │  │  │  │  ├─ 封装 MCPToolWrapper，注册到 ToolRegistry
+# │  │  │  │  └─ 统计已注册数量、记录匹配的启用工具
+# │  │  │  └─ 校验 enabled_tools 不存在的工具，输出警告日志
+# │  │  ├─ 步骤6：拉取并注册 Resources 资源（try捕获兼容无资源服务）
+# │  │  │  └─ 封装 MCPResourceWrapper 注册进注册表
+# │  │  ├─ 步骤7：拉取并注册 Prompts 提示词（try捕获兼容无提示词服务）
+# │  │  │  └─ 封装 MCPPromptWrapper 注册进注册表
+# │  │  ├─ 打印连接成功日志，输出总注册能力数量
+# │  │  └─ 返回 (服务名, 当前服务专属AsyncExitStack)
+# │  ├─ except 全局异常捕获（连接失败）
+# │  │  ├─ 识别JSON/JSONRPC协议污染错误，补充提示文案
+# │  │  ├─ 打印异常堆栈日志
+# │  │  ├─ 安全关闭资源栈（忽略关闭异常）
+# │  │  └─ 返回 (服务名, None)
+# ├─ 外层主逻辑：遍历所有配置 mcp_servers
+# │  ├─ 逐个调用 connect_single_server 连接单个服务
+# │  ├─ 捕获单服务连接外层异常，打印日志并跳过
+# │  └─ 连接成功（返回栈不为空）存入 server_stacks 字典
+# └─ 返回 server_stacks {服务名: AsyncExitStack}
     # 延迟导入MCP客户端相关模块，避免顶层导入拖慢启动速度
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client

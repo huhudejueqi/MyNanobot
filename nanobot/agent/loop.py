@@ -699,7 +699,7 @@ class AgentLoop:
         return cancelled + sub_cancelled
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
-        """Return the session key used for task routing and mid-turn injections."""
+        """返回用于任务路由、会话中途注入逻辑的实际会话标识key"""
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
         return msg.session_key
@@ -907,91 +907,126 @@ class AgentLoop:
 
     async def run(self) -> None:
         """
-        主循环：持续从总线消费消息。
-
-        每收到一条消息，创建一个 asyncio.Task 交给 _dispatch() 处理，
-        从而实现跨 session 并发、同 session 串行。
+        Agent 主循环：持续从消息总线拉取、消费上行消息
+        核心并发设计：
+        每条收到的消息单独创建 asyncio.Task 交给 _dispatch 分发处理
+        实现效果：不同会话之间并发执行，同一个会话内部消息串行排队执行
         """
+        # 标记主循环运行状态
         self._running = True
+        # 初始化连接所有MCP服务
         await self._connect_mcp()
-        logger.info("Agent loop started")
+        logger.info("Agent 消息主循环已启动")
 
+        # 主循环，运行标识为True时持续轮询消息
         while self._running:
+            
             try:
-            # 从总线取消息，1s 超时（用于心跳检测和自动压缩）
+                # 阻塞拉取总线上行消息，设置1秒超时
+                # 超时作用：定时执行过期清理、内存压缩逻辑
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
+            
+            # 捕获1秒超时异常，执行自动压缩、过期数据清理
             except asyncio.TimeoutError:
+                
                 self.auto_compact.check_expired(
                     self._schedule_background,
                     active_session_keys=self._pending_queues.keys(),
                 )
+                # 清理完成，回到循环开头继续拉消息
                 continue
+            
+            # 捕获任务取消异常，用于优雅关闭程序
             except asyncio.CancelledError:
-                # Preserve real task cancellation so shutdown can complete cleanly.
-                # Only ignore non-task CancelledError signals that may leak from integrations.
+                # 区分真实任务取消信号与第三方集成泄漏的无效取消信号
+                # 如果是正常关闭或当前任务被主动取消，向上抛出完成退出流程
                 if not self._running or asyncio.current_task().cancelling():
                     raise
+                # 其他无关取消信号直接忽略，继续循环
                 continue
+            
+            # 捕获所有未知异常，单条消息出错不中断整个主循环
             except Exception as e:
-                logger.warning("Error consuming inbound message: {}, continuing...", e)
+                logger.warning("拉取上行消息发生异常: {}, 继续运行...", e)
                 continue
 
+            # 去除消息首尾空白字符
             raw = msg.content.strip()
+            
+            # 计算当前消息实际归属会话标识（统一会话合并场景会转换key）
             effective_key = self._effective_session_key(msg)
+            # logger.info("effective_key{}",effective_key)
+            # 处理运行时控制指令（如重启、关闭、调试控制类指令）
             if await agent_context.handle_runtime_control(self, msg, self.tools):
+                # 控制指令处理完毕，跳过后续业务分发逻辑
                 continue
+
+            # 判断是否为高优先级指令（紧急指令优先同步执行，不进队列）
             if self.commands.is_priority(raw):
+                # logger.info("self.commands.is_priority{}",raw)
                 await self._dispatch_command_inline(
                     msg, effective_key, raw,
                     self.commands.dispatch_priority,
                 )
                 continue
+
+            # 校验是否为定时轮询消息，若对应会话正在活跃则延迟本次定时任务
             if self._cron_turns.defer_if_active(
                 msg,
                 session_key=effective_key,
                 active_session_keys=self._pending_queues.keys(),
             ):
                 logger.info(
-                    "Deferred cron turn for active session {}",
+                    "会话 {} 当前活跃，延后执行定时轮询任务",
                     effective_key,
                 )
                 continue
-            # If this session already has an active pending queue (i.e. a task
-            # is processing this session), route the message there for mid-turn
-            # injection instead of creating a competing task.
+
+            # 判断：该会话已有正在执行的消息任务（存在待处理消息队列）
+            # 新消息不新建任务，丢进当前会话队列排队，保证同会话串行执行
             if effective_key in self._pending_queues:
-                # Non-priority commands must not be queued for injection;
-                # dispatch them directly (same pattern as priority commands).
+                # 可即时分发的普通指令不走队列，同步直接处理
                 if self.commands.is_dispatchable_command(raw):
                     await self._dispatch_command_inline(
                         msg, effective_key, raw,
                         self.commands.dispatch,
                     )
                     continue
+                
+                # 普通业务消息，准备放入会话排队队列
                 pending_msg = msg
+                # 如果实际会话key和原始消息key不一致，生成新消息对象覆盖会话标识
                 if effective_key != msg.session_key:
                     pending_msg = dataclasses.replace(
                         msg,
                         session_key_override=effective_key,
                     )
+                
                 try:
+                    # 非阻塞写入队列
                     self._pending_queues[effective_key].put_nowait(pending_msg)
                 except asyncio.QueueFull:
+                    # 队列已满，降级策略：放弃排队，新建独立任务处理
                     logger.warning(
-                        "Pending queue full for session {}, falling back to queued task",
+                        "会话 {} 消息等待队列已满，降级创建独立任务处理",
                         effective_key,
                     )
                 else:
                     logger.info(
-                        "Routed follow-up message to pending queue for session {}",
+                        "将后续消息路由至会话 {} 的等待队列排队处理",
                         effective_key,
                     )
+                    # 入队成功，跳过新建任务流程
                     continue
-            # Compute the effective session key before dispatching
-            # This ensures /stop command can find tasks correctly when unified session is enabled
-            # 将消息分派到独立 Task，不阻塞主循环
+
+            # ==============================
+            # 该会话无正在运行的任务，创建全新异步Task处理本条消息
+            # ==============================
             task = asyncio.create_task(self._dispatch(msg))
+            # 记录当前会话所有活跃任务
             self._active_tasks.setdefault(effective_key, []).append(task)
+            
+            # 任务完成回调：自动从会话活跃任务列表移除已结束任务，防止内存泄漏
             task.add_done_callback(
                 lambda t, k=effective_key: self._active_tasks.get(k, [])
                 and self._active_tasks[k].remove(t)
@@ -999,169 +1034,212 @@ class AgentLoop:
                 else None
             )
 
-    async def _dispatch(self, msg: InboundMessage) -> None:
-        """
-        处理单条消息的完整流程：
-        1. 获取 session 锁（同 session 串行）
-        2. 恢复/压缩历史
-        3. 构建上下文，调用 LLM
-        4. 执行工具调用（ReAct 循环）
-        5. 保存消息并发送响应
-        """
-        session_key = self._effective_session_key(msg)
-        if session_key != msg.session_key:
-            msg = dataclasses.replace(msg, session_key_override=session_key)
-        # 获取 session 锁：同一 session 的消息串行执行
-        lock = self._session_locks.setdefault(session_key, asyncio.Lock())
-        gate = self._concurrency_gate or nullcontext()
+        async def _dispatch(self, msg: InboundMessage) -> None:
+            """
+            分发并处理单条入站消息的完整主流程：
+            1. 获取会话独占锁：保证同一个会话的消息串行执行，避免上下文错乱
+            2. 恢复会话历史 / 压缩超长对话上下文
+            3. 组装本次对话执行上下文，调用大模型LLM生成回复
+            4. 循环执行工具调用（ReAct智能工具调用循环，比如调用UE MCP操作引擎）
+            5. 持久化对话记录，向外推送回复消息给客户端
+            """
+            # 计算当前消息真正生效的会话唯一标识
+            session_key = self._effective_session_key(msg)
+            # 如果计算出的会话标识和消息自带的不一致，复制一份新消息覆盖会话key
+            if session_key != msg.session_key:
+                msg = dataclasses.replace(msg, session_key_override=session_key)
 
-        pending: asyncio.Queue | None = None
-        try:
-        # 持有锁时执行状态机（RESTORE -> COMPACT -> ... -> DONE）
-            async with lock, gate:
-                # Only the task that owns the session lock may publish the
-                # active mid-turn injection queue for this session.
-                pending = asyncio.Queue(maxsize=20)
-                self._pending_queues[session_key] = pending
-                try:
-                    on_stream = on_stream_end = None
-                    if msg.metadata.get("_wants_stream"):
-                        # Split one answer into distinct stream segments.
-                        stream_base_id = f"{msg.session_key}:{time.time_ns()}"
-                        stream_segment = 0
+            # 获取会话锁：每个会话对应一把独立异步锁，同一会话消息排队串行执行
+            # setdefault：字典不存在该key则新建asyncio.Lock，存在则直接取出已有锁
+            lock = self._session_locks.setdefault(session_key, asyncio.Lock())
 
-                        def _current_stream_id() -> str:
-                            return f"{stream_base_id}:{stream_segment}"
+            # 并发限流上下文：配置了并发信号量就用信号量限制同时执行任务数；无配置则空上下文不限制并发
+            gate = self._concurrency_gate or nullcontext()
 
-                        async def on_stream(delta: str) -> None:
-                            meta = dict(msg.metadata or {})
-                            meta["_stream_delta"] = True
-                            meta["_stream_id"] = _current_stream_id()
+            # 局部临时队列变量，初始值None；仅当前本次消息分发流程内有效
+            # 类型注解：变量只能是异步队列对象 或 None
+            pending: asyncio.Queue | None = None
+            try:
+                # 同时持有会话锁+并发限流闸门，进入消息处理状态机（恢复上下文→压缩历史→执行对话→结束）
+                async with lock, gate:
+                    # 注释：只有当前持有会话锁的任务，才有权创建、管理本次会话的工具消息临时队列
+                    # 初始化最大容量20的异步队列，用于存放本轮对话中途产生的子消息/工具回调消息
+                    pending = asyncio.Queue(maxsize=20)
+                    # 将当前会话与临时队列绑定存入全局队列字典，供其他逻辑读取
+                    self._pending_queues[session_key] = pending
+
+                    try:
+                        # 流式输出回调、流式结束回调，默认None（不开启流式）
+                        on_stream = on_stream_end = None
+                        # 判断客户端元数据是否声明需要流式分段输出（Codex/网页客户端实时打字效果）
+                        if msg.metadata.get("_wants_stream"):
+                            # 生成当前流式会话唯一ID：会话标识+高精度时间戳
+                            stream_base_id = f"{msg.session_key}:{time.time_ns()}"
+                            # 流式分段序号，每结束一段自增
+                            stream_segment = 0
+
+                            def _current_stream_id() -> str:
+                                """拼接当前分段完整流式ID"""
+                                return f"{stream_base_id}:{stream_segment}"
+
+                            async def on_stream(delta: str) -> None:
+                                """流式片段推送回调：发送单段增量文字给客户端"""
+                                meta = dict(msg.metadata or {})
+                                meta["_stream_delta"] = True  # 标记本条是流式增量片段
+                                meta["_stream_id"] = _current_stream_id()  # 绑定所属流式会话分段ID
+                                # 通过消息总线向外推送增量文本消息
+                                await self.bus.publish_outbound(OutboundMessage(
+                                    channel=msg.channel, chat_id=msg.chat_id,
+                                    content=delta,
+                                    metadata=meta,
+                                ))
+
+                            async def on_stream_end(*, resuming: bool = False) -> None:
+                                """流式结束回调：通知客户端本轮流式输出完成"""
+                                nonlocal stream_segment  # 引用外层函数的分段序号变量
+                                meta = dict(msg.metadata or {})
+                                meta["_stream_end"] = True  # 标记流式输出结束
+                                meta["_resuming"] = resuming  # 是否为中断后恢复输出
+                                meta["_stream_id"] = _current_stream_id()
+                                # 推送空内容结束标记报文
+                                await self.bus.publish_outbound(OutboundMessage(
+                                    channel=msg.channel, chat_id=msg.chat_id,
+                                    content="",
+                                    metadata=meta,
+                                ))
+                                stream_segment += 1  # 分段序号+1，准备下一轮流式输出
+
+                        # 执行消息核心处理逻辑：LLM对话+工具调用循环
+                        # 传入流式回调、本轮会话专用临时队列
+                        response = await self._process_message(
+                            msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                            pending_queue=pending,
+                        )
+
+                        # 记录最终回复要推送的渠道、会话ID
+                        completed_channel = msg.channel
+                        completed_chat_id = msg.chat_id
+                        if response is not None:
+                            # 存在回复报文，推送到消息总线发给客户端
+                            await self.bus.publish_outbound(response)
+                            # 更新实际输出渠道与会话ID（回复可能自动切换渠道）
+                            completed_channel = response.channel
+                            completed_chat_id = response.chat_id
+                        elif msg.channel == "cli":
+                            # 命令行渠道无回复时，推送空报文标记本轮对话结束
                             await self.bus.publish_outbound(OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
-                                content=delta,
-                                metadata=meta,
+                                content="", metadata=msg.metadata or {},
                             ))
 
-                        async def on_stream_end(*, resuming: bool = False) -> None:
-                            nonlocal stream_segment
-                            meta = dict(msg.metadata or {})
-                            meta["_stream_end"] = True
-                            meta["_resuming"] = resuming
-                            meta["_stream_id"] = _current_stream_id()
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="",
-                                metadata=meta,
-                            ))
-                            stream_segment += 1
+                        # 判断是否存在内部续对话标记（工具未执行完、需要继续交互）
+                        continuing = turn_continuation.internal_continuation_pending(msg.metadata)
+                        if not continuing:
+                            # 无后续续对话，触发本轮对话完成事件
+                            await self._runtime_events().turn_completed(
+                                channel=completed_channel,
+                                chat_id=completed_chat_id,
+                                session_key=session_key,
+                                metadata=msg.metadata,
+                            )
+                        # 定时任务模块标记本轮对话正常完成
+                        self._cron_turns.complete(msg, response=response)
 
-                    response = await self._process_message(
-                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
-                        pending_queue=pending,
-                    )
-                    completed_channel = msg.channel
-                    completed_chat_id = msg.chat_id
-                    if response is not None:
-                        await self.bus.publish_outbound(response)
-                        completed_channel = response.channel
-                        completed_chat_id = response.chat_id
-                    elif msg.channel == "cli":
+                    except asyncio.CancelledError:
+                        # 捕获任务取消异常（用户发送/stop、强制终止MCP任务）
+                        self._cron_turns.complete(
+                            msg,
+                            error=asyncio.CancelledError(),
+                        )
+                        logger.info("会话 {} 的任务被用户取消", session_key)
+
+                        # 注释：任务中断时保留已执行的工具结果、助手回复，避免用户丢失上下文
+                        # 工具执行过程中已自动写入会话快照，这里把快照加载到对话历史，下次对话可见
+                        try:
+                            key = self._effective_session_key(msg)
+                            session = self.sessions.get_or_create(key)
+                            # 恢复中断前的运行时快照
+                            if self._restore_runtime_checkpoint(session):
+                                self._clear_pending_user_turn(session)
+                                self.sessions.save(session)
+                                logger.info(
+                                    "已为被取消的会话 {} 恢复中断前的对话上下文快照",
+                                    key,
+                                )
+                        except Exception:
+                            # 恢复快照失败仅打印调试日志，不阻断程序
+                            logger.debug(
+                                "无法为被取消会话 {} 恢复上下文快照",
+                                session_key,
+                                exc_info=True,
+                            )
+                        # 重新抛出取消异常，上层流程感知任务终止
+                        raise
+
+                    except Exception as exc:
+                        # 捕获所有未知运行异常
+                        logger.exception("处理会话 {} 的消息时发生未知错误", session_key)
+                        # 推送错误提示回复给客户端
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=msg.metadata or {},
+                            content="抱歉，处理你的请求时出现了异常。",
                         ))
-                    continuing = turn_continuation.internal_continuation_pending(msg.metadata)
-                    if not continuing:
-                        await self._runtime_events().turn_completed(
-                            channel=completed_channel,
-                            chat_id=completed_chat_id,
-                            session_key=session_key,
-                            metadata=msg.metadata,
-                        )
-                    self._cron_turns.complete(msg, response=response)
-                except asyncio.CancelledError:
-                    self._cron_turns.complete(
-                        msg,
-                        error=asyncio.CancelledError(),
+                        # 无续对话则触发对话完成事件
+                        if not turn_continuation.internal_continuation_pending(msg.metadata):
+                            await self._runtime_events().turn_completed(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                session_key=session_key,
+                                metadata=msg.metadata,
+                            )
+                        # 定时模块标记本轮对话异常结束
+                        self._cron_turns.complete(msg, error=exc)
+
+                    finally:
+                        # 本轮对话收尾清理：处理队列中未消费完的遗留消息
+                        # 注释：队列内剩余未处理消息重新投递至消息总线，作为全新入站消息重新处理，防止消息丢失
+                        # 仅删除当前任务创建的队列；其他等待锁的并发任务不能抢占清理权限
+                        queue = None
+                        # 校验全局队列字典里绑定的队列是不是当前pending，防止多任务错乱
+                        if self._pending_queues.get(session_key) is pending:
+                            queue = self._pending_queues.pop(session_key, None)
+                        else:
+                            queue = pending
+
+                        if queue is not None:
+                            leftover = 0
+                            # 循环取出队列所有残留消息
+                            while True:
+                                try:
+                                    item = queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                                # 残留消息重新投递进入消息总线
+                                await self.bus.publish_inbound(item)
+                                leftover += 1
+                            # 存在残留消息打印日志告知数量
+                            if leftover:
+                                logger.info(
+                                    "为会话 {} 重新投递 {} 条未处理完的遗留消息",
+                                    leftover, session_key,
+                                )
+
+                        # 无内部续对话，更新会话状态为空闲、清空临时对话标记
+                        if not turn_continuation.internal_continuation_pending(msg.metadata):
+                            await self._runtime_events().run_status_changed(
+                                msg, session_key, "idle"
+                            )
+                            self._runtime_events().clear_turn(session_key)
+                        # 执行下一条延迟排队任务
+                        await self._cron_turns.publish_next_deferred(session_key)
+            finally:
+                # 仅当本轮流程未创建临时队列（pending全程为None）时执行空闲状态更新
+                if pending is None:
+                    await self._runtime_events().run_status_changed(
+                        msg, session_key, "idle"
                     )
-                    logger.info("Task cancelled for session {}", session_key)
-                    # Preserve partial context from the interrupted turn so
-                    # the user does not lose tool results and assistant
-                    # messages accumulated before /stop.  The checkpoint was
-                    # already persisted to session metadata by
-                    # _emit_checkpoint during tool execution; materializing
-                    # it into session history now makes it visible in the
-                    # next conversation turn.
-                    try:
-                        key = self._effective_session_key(msg)
-                        session = self.sessions.get_or_create(key)
-                        if self._restore_runtime_checkpoint(session):
-                            self._clear_pending_user_turn(session)
-                            self.sessions.save(session)
-                            logger.info(
-                                "Restored partial context for cancelled session {}",
-                                key,
-                            )
-                    except Exception:
-                        logger.debug(
-                            "Could not restore checkpoint for cancelled session {}",
-                            session_key,
-                            exc_info=True,
-                        )
-                    raise
-                except Exception as exc:
-                    logger.exception("Error processing message for session {}", session_key)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
-                    ))
-                    if not turn_continuation.internal_continuation_pending(msg.metadata):
-                        await self._runtime_events().turn_completed(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            session_key=session_key,
-                            metadata=msg.metadata,
-                        )
-                    self._cron_turns.complete(msg, error=exc)
-                finally:
-                    # Drain any messages still in the pending queue and re-publish
-                    # them to the bus so they are processed as fresh inbound messages
-                    # rather than silently lost.  Only remove our own queue; a
-                    # later task waiting on the lock must not be able to steal
-                    # cleanup ownership.
-                    queue = None
-                    if self._pending_queues.get(session_key) is pending:
-                        queue = self._pending_queues.pop(session_key, None)
-                    else:
-                        queue = pending
-                    if queue is not None:
-                        leftover = 0
-                        while True:
-                            try:
-                                item = queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                break
-                            await self.bus.publish_inbound(item)
-                            leftover += 1
-                        if leftover:
-                            logger.info(
-                                "Re-published {} leftover message(s) to bus for session {}",
-                                leftover, session_key,
-                            )
-                    if not turn_continuation.internal_continuation_pending(msg.metadata):
-                        await self._runtime_events().run_status_changed(
-                            msg, session_key, "idle"
-                        )
-                        self._runtime_events().clear_turn(session_key)
+                    self._runtime_events().clear_turn(session_key)
                     await self._cron_turns.publish_next_deferred(session_key)
-        finally:
-            if pending is None:
-                await self._runtime_events().run_status_changed(
-                    msg, session_key, "idle"
-                )
-                self._runtime_events().clear_turn(session_key)
-                await self._cron_turns.publish_next_deferred(session_key)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
