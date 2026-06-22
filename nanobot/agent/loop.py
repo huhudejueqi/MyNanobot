@@ -671,31 +671,50 @@ class AgentLoop:
         )
 
     async def _dispatch_command_inline(
-        self,
-        msg: InboundMessage,
-        key: str,
-        raw: str,
-        dispatch_fn: Callable[[CommandContext], Awaitable[OutboundMessage | None]],
+            self,
+            msg: InboundMessage,
+            key: str,
+            raw: str,
+            dispatch_fn: Callable[[CommandContext], Awaitable[OutboundMessage | None]],
     ) -> None:
-        """Dispatch a command directly from the run() loop and publish the result."""
+        """
+        从主事件循环run()内直接执行命令分发，并推送命令处理结果
+        :param msg: 用户原始入站消息对象
+        :param key: 当前指令唯一业务标识key
+        :param raw: 用户发送的原始命令文本
+        :param dispatch_fn: 分发处理异步函数，入参CommandContext，返回回复消息或None
+        """
+        # 构造命令上下文，这里会话session暂时传入None，绑定当前事件循环实例self
         ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
+        # 执行传入的分发函数，处理命令逻辑，获取返回的回复消息
         result = await dispatch_fn(ctx)
         if result:
+            # 存在回复消息，通过消息总线对外推送这条出站消息
             await self.bus.publish_outbound(result)
         else:
-            logger.warning("Command '{}' matched but dispatch returned None", raw)
+            # 匹配到了对应命令，但处理函数未返回任何回复，打印警告日志
+            logger.warning("指令 '{}' 匹配 但 分发返回为None", raw)
 
     async def _cancel_active_tasks(self, key: str) -> int:
-        """Cancel and await all active tasks and subagents for *key*.
-
-        Returns the total number of cancelled tasks + subagents.
         """
+        根据会话唯一标识key，取消并等待该会话下所有运行中的任务与子智能体
+        :param key: 会话唯一标识（CommandContext中的ctx.key）
+        :return: 已成功取消的任务数量 + 子智能体数量总和
+        """
+        # 从活跃任务字典中取出当前会话对应的全部任务列表，同时删除该key；无任务则返回空列表
         tasks = self._active_tasks.pop(key, [])
+        # 遍历所有任务，统计：任务未完成 且 调用cancel()成功的数量
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+        
         for t in tasks:
+            # 忽略任务取消异常、其他通用异常，防止等待任务时抛出错误中断流程
             with suppress(asyncio.CancelledError, Exception):
+                # 等待任务完整结束，释放资源
                 await t
+    
+        # 调用子智能体管理器，取消同一会话下所有子智能体，返回取消数量
         sub_cancelled = await self.subagents.cancel_by_session(key)
+        # 返回普通任务取消数 + 子智能体取消数之和
         return cancelled + sub_cancelled
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
@@ -1034,212 +1053,219 @@ class AgentLoop:
                 else None
             )
 
-        async def _dispatch(self, msg: InboundMessage) -> None:
-            """
-            分发并处理单条入站消息的完整主流程：
-            1. 获取会话独占锁：保证同一个会话的消息串行执行，避免上下文错乱
-            2. 恢复会话历史 / 压缩超长对话上下文
-            3. 组装本次对话执行上下文，调用大模型LLM生成回复
-            4. 循环执行工具调用（ReAct智能工具调用循环，比如调用UE MCP操作引擎）
-            5. 持久化对话记录，向外推送回复消息给客户端
-            """
-            # 计算当前消息真正生效的会话唯一标识
-            session_key = self._effective_session_key(msg)
-            # 如果计算出的会话标识和消息自带的不一致，复制一份新消息覆盖会话key
-            if session_key != msg.session_key:
-                msg = dataclasses.replace(msg, session_key_override=session_key)
+    async def _dispatch(self, msg: InboundMessage) -> None:
+        """
+        分发并处理单条入站消息的完整主流程：
+        1. 获取会话独占锁：保证同一个会话的消息串行执行，避免上下文错乱
+        2. 恢复会话历史 / 压缩超长对话上下文
+        3. 组装本次对话执行上下文，调用大模型LLM生成回复
+        4. 循环执行工具调用（ReAct智能工具调用循环，比如调用UE MCP操作引擎）
+        5. 持久化对话记录，向外推送回复消息给客户端
+        """
+        # 计算当前消息真正生效的会话唯一标识
+        session_key = self._effective_session_key(msg)
+        # 如果计算出的会话标识和消息自带的不一致，复制一份新消息覆盖会话key
+        if session_key != msg.session_key:
+            msg = dataclasses.replace(msg, session_key_override=session_key)
 
-            # 获取会话锁：每个会话对应一把独立异步锁，同一会话消息排队串行执行
-            # setdefault：字典不存在该key则新建asyncio.Lock，存在则直接取出已有锁
-            lock = self._session_locks.setdefault(session_key, asyncio.Lock())
+        # 获取会话锁：每个会话对应一把独立异步锁，同一会话消息排队串行执行
+        # setdefault：字典不存在该key则新建asyncio.Lock，存在则直接取出已有锁
+        lock = self._session_locks.setdefault(session_key, asyncio.Lock())
 
-            # 并发限流上下文：配置了并发信号量就用信号量限制同时执行任务数；无配置则空上下文不限制并发
-            gate = self._concurrency_gate or nullcontext()
+        # 并发限流上下文：配置了并发信号量就用信号量限制同时执行任务数；无配置则空上下文不限制并发
+        gate = self._concurrency_gate or nullcontext()
 
-            # 局部临时队列变量，初始值None；仅当前本次消息分发流程内有效
-            # 类型注解：变量只能是异步队列对象 或 None
-            pending: asyncio.Queue | None = None
-            try:
-                # 同时持有会话锁+并发限流闸门，进入消息处理状态机（恢复上下文→压缩历史→执行对话→结束）
-                async with lock, gate:
-                    # 注释：只有当前持有会话锁的任务，才有权创建、管理本次会话的工具消息临时队列
-                    # 初始化最大容量20的异步队列，用于存放本轮对话中途产生的子消息/工具回调消息
-                    pending = asyncio.Queue(maxsize=20)
-                    # 将当前会话与临时队列绑定存入全局队列字典，供其他逻辑读取
-                    self._pending_queues[session_key] = pending
+        # 局部临时队列变量，初始值None；仅当前本次消息分发流程内有效
+        # 类型注解：变量只能是异步队列对象 或 None
+        pending: asyncio.Queue | None = None
+        try:
+            # 同时持有会话锁+并发限流闸门，进入消息处理状态机（恢复上下文→压缩历史→执行对话→结束）
+            async with lock, gate:
+                # 注释：只有当前持有会话锁的任务，才有权创建、管理本次会话的工具消息临时队列
+                # 初始化最大容量20的异步队列，用于存放本轮对话中途产生的子消息/工具回调消息
+                pending = asyncio.Queue(maxsize=20)
+                # 将当前会话与临时队列绑定存入全局队列字典，供其他逻辑读取
+                self._pending_queues[session_key] = pending
 
-                    try:
-                        # 流式输出回调、流式结束回调，默认None（不开启流式）
-                        on_stream = on_stream_end = None
-                        # 判断客户端元数据是否声明需要流式分段输出（Codex/网页客户端实时打字效果）
-                        if msg.metadata.get("_wants_stream"):
-                            # 生成当前流式会话唯一ID：会话标识+高精度时间戳
-                            stream_base_id = f"{msg.session_key}:{time.time_ns()}"
-                            # 流式分段序号，每结束一段自增
-                            stream_segment = 0
+                try:
+                    # 流式输出回调、流式结束回调，默认None（不开启流式）
+                    on_stream = on_stream_end = None
+                    # 判断客户端元数据是否声明需要流式分段输出（Codex/网页客户端实时打字效果）
+                    if msg.metadata.get("_wants_stream"):
+                        # 生成当前流式会话唯一ID：会话标识+高精度时间戳
+                        stream_base_id = f"{msg.session_key}:{time.time_ns()}"
+                        # 流式分段序号，每结束一段自增
+                        stream_segment = 0
 
-                            def _current_stream_id() -> str:
-                                """拼接当前分段完整流式ID"""
-                                return f"{stream_base_id}:{stream_segment}"
+                        def _current_stream_id() -> str:
+                            """拼接当前分段完整流式ID"""
+                            return f"{stream_base_id}:{stream_segment}"
 
-                            async def on_stream(delta: str) -> None:
-                                """流式片段推送回调：发送单段增量文字给客户端"""
-                                meta = dict(msg.metadata or {})
-                                meta["_stream_delta"] = True  # 标记本条是流式增量片段
-                                meta["_stream_id"] = _current_stream_id()  # 绑定所属流式会话分段ID
-                                # 通过消息总线向外推送增量文本消息
-                                await self.bus.publish_outbound(OutboundMessage(
-                                    channel=msg.channel, chat_id=msg.chat_id,
-                                    content=delta,
-                                    metadata=meta,
-                                ))
-
-                            async def on_stream_end(*, resuming: bool = False) -> None:
-                                """流式结束回调：通知客户端本轮流式输出完成"""
-                                nonlocal stream_segment  # 引用外层函数的分段序号变量
-                                meta = dict(msg.metadata or {})
-                                meta["_stream_end"] = True  # 标记流式输出结束
-                                meta["_resuming"] = resuming  # 是否为中断后恢复输出
-                                meta["_stream_id"] = _current_stream_id()
-                                # 推送空内容结束标记报文
-                                await self.bus.publish_outbound(OutboundMessage(
-                                    channel=msg.channel, chat_id=msg.chat_id,
-                                    content="",
-                                    metadata=meta,
-                                ))
-                                stream_segment += 1  # 分段序号+1，准备下一轮流式输出
-
-                        # 执行消息核心处理逻辑：LLM对话+工具调用循环
-                        # 传入流式回调、本轮会话专用临时队列
-                        response = await self._process_message(
-                            msg, on_stream=on_stream, on_stream_end=on_stream_end,
-                            pending_queue=pending,
-                        )
-
-                        # 记录最终回复要推送的渠道、会话ID
-                        completed_channel = msg.channel
-                        completed_chat_id = msg.chat_id
-                        if response is not None:
-                            # 存在回复报文，推送到消息总线发给客户端
-                            await self.bus.publish_outbound(response)
-                            # 更新实际输出渠道与会话ID（回复可能自动切换渠道）
-                            completed_channel = response.channel
-                            completed_chat_id = response.chat_id
-                        elif msg.channel == "cli":
-                            # 命令行渠道无回复时，推送空报文标记本轮对话结束
+                        async def on_stream(delta: str) -> None:
+                            """流式片段推送回调：发送单段增量文字给客户端"""
+                            meta = dict(msg.metadata or {})
+                            meta["_stream_delta"] = True  # 标记本条是流式增量片段
+                            meta["_stream_id"] = _current_stream_id()  # 绑定所属流式会话分段ID
+                            # 通过消息总线向外推送增量文本消息
                             await self.bus.publish_outbound(OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
-                                content="", metadata=msg.metadata or {},
+                                content=delta,
+                                metadata=meta,
                             ))
 
-                        # 判断是否存在内部续对话标记（工具未执行完、需要继续交互）
-                        continuing = turn_continuation.internal_continuation_pending(msg.metadata)
-                        if not continuing:
-                            # 无后续续对话，触发本轮对话完成事件
-                            await self._runtime_events().turn_completed(
-                                channel=completed_channel,
-                                chat_id=completed_chat_id,
-                                session_key=session_key,
-                                metadata=msg.metadata,
-                            )
-                        # 定时任务模块标记本轮对话正常完成
-                        self._cron_turns.complete(msg, response=response)
+                        async def on_stream_end(*, resuming: bool = False) -> None:
+                            """流式结束回调：通知客户端本轮流式输出完成"""
+                            nonlocal stream_segment  # 引用外层函数的分段序号变量
+                            meta = dict(msg.metadata or {})
+                            meta["_stream_end"] = True  # 标记流式输出结束
+                            meta["_resuming"] = resuming  # 是否为中断后恢复输出
+                            meta["_stream_id"] = _current_stream_id()
+                            # 推送空内容结束标记报文
+                            await self.bus.publish_outbound(OutboundMessage(
+                                channel=msg.channel, chat_id=msg.chat_id,
+                                content="",
+                                metadata=meta,
+                            ))
+                            stream_segment += 1  # 分段序号+1，准备下一轮流式输出
 
-                    except asyncio.CancelledError:
-                        # 捕获任务取消异常（用户发送/stop、强制终止MCP任务）
-                        self._cron_turns.complete(
-                            msg,
-                            error=asyncio.CancelledError(),
-                        )
-                        logger.info("会话 {} 的任务被用户取消", session_key)
+                    # 执行消息核心处理逻辑：LLM对话+工具调用循环
+                    # 传入流式回调、本轮会话专用临时队列
+                    response = await self._process_message(
+                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        pending_queue=pending,
+                    )
 
-                        # 注释：任务中断时保留已执行的工具结果、助手回复，避免用户丢失上下文
-                        # 工具执行过程中已自动写入会话快照，这里把快照加载到对话历史，下次对话可见
-                        try:
-                            key = self._effective_session_key(msg)
-                            session = self.sessions.get_or_create(key)
-                            # 恢复中断前的运行时快照
-                            if self._restore_runtime_checkpoint(session):
-                                self._clear_pending_user_turn(session)
-                                self.sessions.save(session)
-                                logger.info(
-                                    "已为被取消的会话 {} 恢复中断前的对话上下文快照",
-                                    key,
-                                )
-                        except Exception:
-                            # 恢复快照失败仅打印调试日志，不阻断程序
-                            logger.debug(
-                                "无法为被取消会话 {} 恢复上下文快照",
-                                session_key,
-                                exc_info=True,
-                            )
-                        # 重新抛出取消异常，上层流程感知任务终止
-                        raise
-
-                    except Exception as exc:
-                        # 捕获所有未知运行异常
-                        logger.exception("处理会话 {} 的消息时发生未知错误", session_key)
-                        # 推送错误提示回复给客户端
+                    # 记录最终回复要推送的渠道、会话ID
+                    completed_channel = msg.channel
+                    completed_chat_id = msg.chat_id
+                    if response is not None:
+                        # 存在回复报文，推送到消息总线发给客户端
+                        await self.bus.publish_outbound(response)
+                        # 更新实际输出渠道与会话ID（回复可能自动切换渠道）
+                        completed_channel = response.channel
+                        completed_chat_id = response.chat_id
+                    elif msg.channel == "cli":
+                        # 命令行渠道无回复时，推送空报文标记本轮对话结束
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
-                            content="抱歉，处理你的请求时出现了异常。",
+                            content="", metadata=msg.metadata or {},
                         ))
-                        # 无续对话则触发对话完成事件
-                        if not turn_continuation.internal_continuation_pending(msg.metadata):
-                            await self._runtime_events().turn_completed(
-                                channel=msg.channel,
-                                chat_id=msg.chat_id,
-                                session_key=session_key,
-                                metadata=msg.metadata,
-                            )
-                        # 定时模块标记本轮对话异常结束
-                        self._cron_turns.complete(msg, error=exc)
 
-                    finally:
-                        # 本轮对话收尾清理：处理队列中未消费完的遗留消息
-                        # 注释：队列内剩余未处理消息重新投递至消息总线，作为全新入站消息重新处理，防止消息丢失
-                        # 仅删除当前任务创建的队列；其他等待锁的并发任务不能抢占清理权限
-                        queue = None
-                        # 校验全局队列字典里绑定的队列是不是当前pending，防止多任务错乱
-                        if self._pending_queues.get(session_key) is pending:
-                            queue = self._pending_queues.pop(session_key, None)
-                        else:
-                            queue = pending
+                    # 判断是否存在内部续对话标记（工具未执行完、需要继续交互）
+                    continuing = turn_continuation.internal_continuation_pending(msg.metadata)
+                    if not continuing:
+                        # 无后续续对话，触发本轮对话完成事件
+                        await self._runtime_events().turn_completed(
+                            channel=completed_channel,
+                            chat_id=completed_chat_id,
+                            session_key=session_key,
+                            metadata=msg.metadata,
+                        )
+                    # 定时任务模块标记本轮对话正常完成
+                    self._cron_turns.complete(msg, response=response)
 
-                        if queue is not None:
-                            leftover = 0
-                            # 循环取出队列所有残留消息
-                            while True:
-                                try:
-                                    item = queue.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    break
-                                # 残留消息重新投递进入消息总线
-                                await self.bus.publish_inbound(item)
-                                leftover += 1
-                            # 存在残留消息打印日志告知数量
-                            if leftover:
-                                logger.info(
-                                    "为会话 {} 重新投递 {} 条未处理完的遗留消息",
-                                    leftover, session_key,
-                                )
-
-                        # 无内部续对话，更新会话状态为空闲、清空临时对话标记
-                        if not turn_continuation.internal_continuation_pending(msg.metadata):
-                            await self._runtime_events().run_status_changed(
-                                msg, session_key, "idle"
-                            )
-                            self._runtime_events().clear_turn(session_key)
-                        # 执行下一条延迟排队任务
-                        await self._cron_turns.publish_next_deferred(session_key)
-            finally:
-                # 仅当本轮流程未创建临时队列（pending全程为None）时执行空闲状态更新
-                if pending is None:
-                    await self._runtime_events().run_status_changed(
-                        msg, session_key, "idle"
+                except asyncio.CancelledError:
+                    # 捕获任务取消异常（用户发送/stop、强制终止MCP任务）
+                    self._cron_turns.complete(
+                        msg,
+                        error=asyncio.CancelledError(),
                     )
-                    self._runtime_events().clear_turn(session_key)
+                    logger.info("会话 {} 的任务被用户取消", session_key)
+
+                    # 注释：任务中断时保留已执行的工具结果、助手回复，避免用户丢失上下文
+                    # 工具执行过程中已自动写入会话快照，这里把快照加载到对话历史，下次对话可见
+                    try:
+                        key = self._effective_session_key(msg)
+                        session = self.sessions.get_or_create(key)
+                        # 恢复中断前的运行时快照
+                        if self._restore_runtime_checkpoint(session):
+                            self._clear_pending_user_turn(session)
+                            self.sessions.save(session)
+                            logger.info(
+                                "已为被取消的会话 {} 恢复中断前的对话上下文快照",
+                                key,
+                            )
+                    except Exception:
+                        # 恢复快照失败仅打印调试日志，不阻断程序
+                        logger.debug(
+                            "无法为被取消会话 {} 恢复上下文快照",
+                            session_key,
+                            exc_info=True,
+                        )
+                    # 通知前端本轮对话已结束（前端 turn_end 事件触发停止按钮消失）
+                    await self._runtime_events().turn_completed(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        session_key=session_key,
+                        metadata=msg.metadata,
+                    )
+                    # 重新抛出取消异常，上层流程感知任务终止
+                    raise
+
+                except Exception as exc:
+                    # 捕获所有未知运行异常
+                    logger.exception("处理会话 {} 的消息时发生未知错误", session_key)
+                    # 推送错误提示回复给客户端
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="抱歉，处理你的请求时出现了异常。",
+                    ))
+                    # 无续对话则触发对话完成事件
+                    if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        await self._runtime_events().turn_completed(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            session_key=session_key,
+                            metadata=msg.metadata,
+                        )
+                    # 定时模块标记本轮对话异常结束
+                    self._cron_turns.complete(msg, error=exc)
+
+                finally:
+                    # 本轮对话收尾清理：处理队列中未消费完的遗留消息
+                    # 注释：队列内剩余未处理消息重新投递至消息总线，作为全新入站消息重新处理，防止消息丢失
+                    # 仅删除当前任务创建的队列；其他等待锁的并发任务不能抢占清理权限
+                    queue = None
+                    # 校验全局队列字典里绑定的队列是不是当前pending，防止多任务错乱
+                    if self._pending_queues.get(session_key) is pending:
+                        queue = self._pending_queues.pop(session_key, None)
+                    else:
+                        queue = pending
+
+                    if queue is not None:
+                        leftover = 0
+                        # 循环取出队列所有残留消息
+                        while True:
+                            try:
+                                item = queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                            # 残留消息重新投递进入消息总线
+                            await self.bus.publish_inbound(item)
+                            leftover += 1
+                        # 存在残留消息打印日志告知数量
+                        if leftover:
+                            logger.info(
+                                "为会话 {} 重新投递 {} 条未处理完的遗留消息",
+                                leftover, session_key,
+                            )
+
+                    # 无内部续对话，更新会话状态为空闲、清空临时对话标记
+                    if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        await self._runtime_events().run_status_changed(
+                            msg, session_key, "idle"
+                        )
+                        self._runtime_events().clear_turn(session_key)
+                    # 执行下一条延迟排队任务
                     await self._cron_turns.publish_next_deferred(session_key)
+        finally:
+            # 仅当本轮流程未创建临时队列（pending全程为None）时执行空闲状态更新
+            if pending is None:
+                await self._runtime_events().run_status_changed(
+                    msg, session_key, "idle"
+                )
+                self._runtime_events().clear_turn(session_key)
+                await self._cron_turns.publish_next_deferred(session_key)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -1364,20 +1390,22 @@ class AgentLoop:
         )
 
     async def _process_message(
-        self,
-        msg: InboundMessage,
-        session_key: str | None = None,
-        on_progress: Callable[..., Awaitable[None]] | None = None,
-        on_stream: Callable[[str], Awaitable[None]] | None = None,
-        on_stream_end: Callable[..., Awaitable[None]] | None = None,
-        pending_queue: asyncio.Queue | None = None,
-        ephemeral: bool = False,
-        tools: ToolRegistry | None = None,
-    ) -> OutboundMessage | None:
-        """Process a single inbound message and return the response."""
+            self,
+            msg: InboundMessage,  # 入站消息对象
+            session_key: str | None = None,  # 会话唯一标识，可为空
+            on_progress: Callable[..., Awaitable[None]] | None = None,  # 进度异步回调函数（可选）
+            on_stream: Callable[[str], Awaitable[None]] | None = None,  # 流式输出异步回调：入参为字符串分片（可选）
+            on_stream_end: Callable[..., Awaitable[None]] | None = None,  # 流式结束异步回调（可选）
+            pending_queue: asyncio.Queue | None = None,  # 待处理任务异步队列（可选）
+            ephemeral: bool = False,  # 是否临时会话（临时会话不持久化上下文，默认关闭）
+            tools: ToolRegistry | None = None,  # 工具注册管理器（函数调用工具集，可选）
+        ) -> OutboundMessage | None:  # 返回出站响应消息，处理异常时可返回空
+        # 刷新底层大模型服务商配置快照（更新模型/密钥/限流等配置）
         self._refresh_provider_snapshot()
-
+        
+        # 判断消息渠道：系统内置指令消息
         if msg.channel == "system":
+            # 分流调用系统消息专用处理逻辑
             return await self._process_system_message(
                 msg,
                 session_key=session_key,
@@ -1387,78 +1415,101 @@ class AgentLoop:
                 pending_queue=pending_queue,
             )
 
+        # 优先使用传入的会话ID，无则从消息体内读取会话ID
         key = session_key or msg.session_key
+        # 记录当前时间戳（秒级，用于耗时统计）
         t0 = time.time()
+        # 构建单次会话轮次上下文对象
+        
         ctx = TurnContext(
-            msg=msg,
-            session=None,
-            session_key=key,
-            state=TurnState.RESTORE,
-            turn_id=f"{key}:{time.time_ns()}",
-            turn_wall_started_at=t0,
+            msg=msg,  # 原始入站消息
+            session=None,  # 会话实例（初始为空，后续状态机加载）
+            session_key=key,  # 会话标识
+            state=TurnState.RESTORE,  # 状态机初始状态：恢复会话上下文
+            turn_id=f"{key}:{time.time_ns()}",  # 本轮唯一ID：会话ID+纳秒级时间戳，防重复
+            turn_wall_started_at=t0,  # 本轮请求开始时间戳
+            # 从消息元数据读取续跑启动时间（断点续传/长会话续跑场景）
             visible_run_started_at=turn_continuation.internal_continuation_run_started_at(
                 msg.metadata,
             ),
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            pending_queue=pending_queue,
-            ephemeral=ephemeral,
-            tools=tools,
+            on_progress=on_progress,  # 进度回调注入上下文
+            on_stream=on_stream,  # 流式分片回调注入上下文
+            on_stream_end=on_stream_end,  # 流式结束回调注入上下文
+            pending_queue=pending_queue,  # 异步任务队列注入上下文
+            ephemeral=ephemeral,  # 临时会话标记
+            tools=tools,  # 工具调用注册表注入上下文
         )
 
+        # 状态机主循环：未到达完成状态则持续流转
         while ctx.state is not TurnState.DONE:
+            # 根据当前状态名称拼接对应处理方法名（如RESTORE → _state_restore）
             handler_name = f"_state_{ctx.state.name.lower()}"
+            logger.info("状态机主循环{}",handler_name)
+            # 获取当前状态对应的处理函数
             handler = getattr(self, handler_name, None)
+            # 无对应状态处理器，抛出运行时异常
             if handler is None:
-                raise RuntimeError(f"Missing state handler for {ctx.state}")
+                raise RuntimeError(f"缺少 {ctx.state} 状态对应的处理函数")
 
+            # 高精度计时起点（用于计算单状态耗时，毫秒精度）
             t0 = time.perf_counter()
             try:
+                # 执行当前状态逻辑，返回状态流转事件标识
                 event = await handler(ctx)
             except Exception:
+                # 捕获任意异常，计算当前状态执行耗时（毫秒）
                 duration = (time.perf_counter() - t0) * 1000
+                # 写入状态追踪日志：标记执行失败
                 ctx.trace.append(
                     StateTraceEntry(
-                        state=ctx.state,
-                        started_at=t0,
-                        duration_ms=duration,
-                        event="",
-                        error="exception",
+                        state=ctx.state,  # 当前出错状态
+                        started_at=t0,  # 状态开始时间
+                        duration_ms=duration,  # 执行耗时
+                        event="",  # 无正常流转事件
+                        error="exception",  # 错误类型：程序异常
                     )
                 )
+                # 重新抛出异常，中断整个会话处理
                 raise
 
+            # 正常执行完成，计算当前状态耗时
             duration = (time.perf_counter() - t0) * 1000
+            # 记录本次状态执行轨迹（用于排查耗时、流程链路）
             ctx.trace.append(
                 StateTraceEntry(
                     state=ctx.state,
                     started_at=t0,
                     duration_ms=duration,
-                    event=event,
+                    event=event,  # 本次产生的流转事件
                 )
             )
+            # 调试日志：打印轮次ID、当前状态、耗时、触发事件
             logger.debug(
-                "[turn {}] State {} took {:.1f}ms -> event {}",
+                "[本轮会话 {}] 状态 {} 执行耗时 {:.1f}ms → 触发事件 {}",
                 ctx.turn_id,
                 ctx.state.name,
                 duration,
                 event,
             )
 
+            # 从状态流转映射表，查询当前状态+事件对应的下一个状态
             next_state = self._TRANSITIONS.get((ctx.state, event))
+            # 无匹配流转规则，抛出异常（流程非法）
             if next_state is None:
                 raise RuntimeError(
-                    f"[turn {ctx.turn_id}] No transition from {ctx.state} "
-                    f"on event {event!r}"
+                    f"[本轮会话 {ctx.turn_id}] 不存在流转规则：从 {ctx.state} "
+                    f"触发事件 {event!r} 无目标状态"
                 )
+            # 更新上下文状态，进入下一轮循环处理
             ctx.state = next_state
 
+        # 状态机全部流转完成，打印调试日志：记录总共执行了多少个状态节点
         logger.debug(
-            "[turn {}] Turn completed after {} states",
+            "[本轮会话 {}] 会话处理完成，共执行 {} 个状态节点",
             ctx.turn_id,
             len(ctx.trace),
         )
+        # 返回最终生成的出站响应消息
         return ctx.outbound
 
     def _assemble_outbound(
@@ -1495,34 +1546,96 @@ class AgentLoop:
         )
 
     async def _state_restore(self, ctx: TurnContext) -> TurnState:
-        """Restore checkpoint / pending user turn; extract documents."""
+        """
+        恢复会话检查点 / 用户未完成对话轮次；同时提取消息内附件文档
+        功能：加载上次中断的会话状态、恢复待处理用户对话、预处理消息媒体资源
+        参数 ctx: TurnContext - 当前一轮对话的上下文对象，封装消息、会话、渠道等全部上下文数据
+        返回 TurnState - 对话轮次状态对象（这里代码实际return字符串"ok"，存在类型标注不一致）
+
+        _state_restore(入参: TurnContext ctx)
+        ├─ 步骤1：提取当前消息 msg = ctx.msg
+        ├─ 步骤2：判断消息是否携带媒体附件 msg.media
+        │  ├─ 分支A：存在媒体
+        │  │  ├─ 调用 _prepare_message_media 处理文本+媒体 → 得到 new_content、image_only
+        │  │  ├─ dataclasses.replace 生成新消息，覆盖 ctx.msg
+        │  │  └─ 更新本地变量 msg = 处理后的新消息
+        │  └─ 分支B：无媒体 → 跳过媒体处理
+        ├─ 步骤3：生成日志预览文本（截取前80字符，超长加省略号）
+        ├─ 步骤4：打印日志：渠道ID、发送人、消息预览
+        ├─ 步骤5：校验会话对象 ctx.session 是否为空
+        │  ├─ 分支A：session为空
+        │  │  └─ 通过 session_key 获取/新建持久会话，赋值给 ctx.session
+        │  └─ 分支B：session已存在 → 跳过创建
+        ├─ 步骤6：触发运行时事件 session_turn_started（标记新一轮对话开始）
+        ├─ 步骤7：持久化当前消息对应的工作空间作用域到会话
+        ├─ 步骤8：恢复运行时断点检查点 _restore_runtime_checkpoint
+        │  ├─ 分支A：恢复后状态变更（返回True）
+        │  │  └─ 保存会话 self.sessions.save(ctx.session)
+        │  └─ 分支B：无变更 → 不保存
+        ├─ 步骤9：恢复未完成用户对话轮次 _restore_pending_user_turn
+        │  ├─ 分支A：恢复后状态变更（返回True）
+        │  │  └─ 保存会话 self.sessions.save(ctx.session)
+        │  └─ 分支B：无变更 → 不保存
+        └─ 步骤10：返回字符串 "ok"
+            补充：类型注解标注返回 TurnState，实际返回字符串，存在类型不匹配问题
+        """
+        # 取出上下文里的用户消息对象
         msg = ctx.msg
 
+        # 如果消息携带图片/文件等媒体附件，执行预处理
         if msg.media:
+            # 处理消息正文+媒体资源：转换媒体格式、剥离纯图片资源
             new_content, image_only = self._prepare_message_media(msg.content, msg.media)
+            # 复制一份全新消息对象，替换处理后的正文与媒体字段（dataclasses.replace 不可变数据更新）
             ctx.msg = dataclasses.replace(msg, content=new_content, media=image_only)
+            # 同步更新本地msg变量为处理后的新消息
             msg = ctx.msg
 
+        # 截取消息前80字符做日志预览，过长则末尾拼接省略号
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+        # 打印日志：渠道ID、发送者ID、消息预览内容
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        # Session is already fetched by the caller (_process_message) but
-        # ensure it exists in case this handler is invoked independently.
+        # 注释说明：上层调用函数 _process_message 理论上已经加载过会话
+        # 此处做兼容兜底：防止该函数被单独调用、会话未初始化的场景
+        # Session = 用户持久会话，存储历史对话、记忆、检查点、配置
+        logger.info("ctx.session start")
         if ctx.session is None:
+            logger.info("ctx.session is None")
+            # 根据会话唯一标识，获取已有会话；不存在则新建空会话
             ctx.session = self.sessions.get_or_create(ctx.session_key)
+        logger.info("ctx.session end")
+        # 触发运行时事件：标记当前会话开启一轮新对话
         await self._runtime_events().session_turn_started(msg, ctx.session_key)
+        # 将本次消息关联的工作空间作用域持久化存入会话（区分多项目/多文件夹隔离）
         self.workspace_scopes.persist_message_scope(ctx.session, msg)
 
+        # 1. 恢复运行时断点检查点（Agent中途中断、工具执行一半的上下文）
+        # 函数返回True代表状态发生变更，需要落地保存会话
         if self._restore_runtime_checkpoint(ctx.session):
+            logger.info("_restore_runtime_checkpoint")
             self.sessions.save(ctx.session)
+        
+        # 2. 恢复用户未完成的对话轮次（比如上一轮AI回复一半中断、等待用户续聊）
+        # 状态变更则持久化会话数据到磁盘/数据库
         if self._restore_pending_user_turn(ctx.session):
+            logger.info("_restore_pending_user_turn")
             self.sessions.save(ctx.session)
 
+        # 函数标注返回TurnState，但实际返回字符串"ok"，属于代码小bug/标注疏漏
         return "ok"
-
+    
     def _prepare_message_media(self, content: str, media: list[str]) -> tuple[str, list[str]]:
+        """预处理消息正文与附件文件列表
+        :param content: 消息文本内容
+        :param media: 媒体/附件文件路径/标识列表
+        :return: 处理后的(新文本内容, 过滤后的附件列表)二元组
+        """
+        # 判断是否需要提取文档内文字
         if self._should_extract_document_text():
+            # 提取附件文档中的文本，并更新正文、过滤附件列表后返回
             return extract_documents(content, media)
+        # 不提取文档文字：仅标记引用非图片类附件，原样处理正文和附件
         return reference_non_image_attachments(content, media)
 
     def _should_extract_document_text(self) -> bool:
@@ -1913,13 +2026,19 @@ class AgentLoop:
         return True
 
     def _restore_pending_user_turn(self, session: Session) -> bool:
-        """Close a turn that only persisted the user message before crashing."""
+        """
+        恢复程序崩溃前仅保存了用户消息、未生成助手回复的会话轮次
+        返回布尔值：True表示执行了恢复逻辑，False表示无需处理
+        """
         from datetime import datetime
 
+        # 如果会话元数据中不存在待处理用户轮次标记，直接返回无需恢复
         if not session.metadata.get(self._PENDING_USER_TURN_KEY):
             return False
 
+        # 校验会话最后一条消息是否为用户发言（说明中断在用户发消息后、AI回复前）
         if session.messages and session.messages[-1].get("role") == "user":
+            # 追加一条系统错误提示的助手消息，标记本次对话因程序中断失败
             session.messages.append(
                 {
                     "role": "assistant",
@@ -1927,8 +2046,10 @@ class AgentLoop:
                     "timestamp": datetime.now().isoformat(),
                 }
             )
+            # 更新会话最后修改时间戳
             session.updated_at = datetime.now()
 
+        # 清除会话元数据里标记待处理用户轮次的标识
         self._clear_pending_user_turn(session)
         return True
 

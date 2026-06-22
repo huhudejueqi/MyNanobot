@@ -126,14 +126,23 @@ def builtin_command_palette() -> list[dict[str, str]]:
 
 
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
-    """Cancel all active tasks and subagents for the session."""
+    """高优先级 /stop 命令处理函数
+    作用：取消当前会话下所有正在运行的任务与子智能体
+    """
+    # 取出上下文里的异步事件循环对象
     loop = ctx.loop
+    # 取出用户发送的原始消息对象（渠道、会话ID、元数据等）
     msg = ctx.msg
+    # 调用循环内置方法，根据会话唯一key终止全部活跃任务，返回成功取消的任务数量
     total = await loop._cancel_active_tasks(ctx.key)
+    # 根据取消任务数量拼接回复文案：有任务就提示已停止N个，无任务则提示当前无运行任务
     content = f"Stopped {total} task(s)." if total else "No active task to stop."
+    # 构造对外回复消息对象并返回
     return OutboundMessage(
-        channel=msg.channel, chat_id=msg.chat_id, content=content,
-        metadata=dict(msg.metadata or {})
+        channel=msg.channel,        # 复用用户消息的通讯渠道
+        chat_id=msg.chat_id,        # 复用对话ID，保证回复发到对应会话
+        content=content,            # 停止结果提示文本
+        metadata=dict(msg.metadata or {})  # 拷贝原消息携带的元数据，无则用空字典
     )
 
 

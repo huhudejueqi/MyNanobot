@@ -153,13 +153,28 @@ class WorkspaceScopeResolver:
         )
 
     def persist_message_scope(self, session: Any, msg: Any) -> None:
+        """
+        将消息中携带的工作空间作用域持久化保存到会话元数据
+        仅当消息属于当前限定频道、且携带合法作用域元数据时才会更新会话
+        :param session: 用户会话对象，存储会话持久元数据
+        :param msg: 收到的消息对象，包含频道、元数据信息
+        :return: 无返回值
+        """
+        # 校验：仅处理当前实例绑定的限定频道消息，其他频道直接跳过
         if getattr(msg, "channel", None) != self.scoped_channel:
             return
+        
+        # 获取消息附带的元数据字段，不存在则为None
         metadata = getattr(msg, "metadata", None)
+        # 校验元数据必须是字典类型，非字典直接退出不处理
         if not isinstance(metadata, dict):
             return
+        
+        # 从消息元数据中取出工作空间作用域对应的原始数据
         raw = metadata.get(WORKSPACE_SCOPE_METADATA_KEY)
+        # 校验取出的原始作用域数据为字典，合法则同步到会话元数据
         if isinstance(raw, dict):
+            # 浅拷贝字典存入会话，避免消息原始字典与会话引用共享、互相污染
             session.metadata[WORKSPACE_SCOPE_METADATA_KEY] = dict(raw)
 
 
