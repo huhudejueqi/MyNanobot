@@ -43,20 +43,33 @@ class AutoCompact:
         return key.startswith(cls._INTERNAL_SESSION_PREFIXES)
 
     def check_expired(self, schedule_background: Callable[[Coroutine], None],
-                      active_session_keys: Collection[str] = ()) -> None:
-        """Schedule archival for idle sessions, skipping those with in-flight agent tasks."""
+                    active_session_keys: Collection[str] = ()) -> None:
+        """
+        为闲置会话安排归档任务，跳过正在执行智能体任务的会话
+        :param schedule_background: 后台任务调度函数，接收协程对象并异步执行
+        :param active_session_keys: 当前活跃会话key集合，这些会话不参与过期清理
+        """
+        # 获取当前系统时间
         now = datetime.now()
+        # 遍历所有已存在的会话信息
         for info in self.sessions.list_sessions():
+            # 取出会话唯一标识key，无key则为空字符串
             key = info.get("key", "")
+            # 跳过三类会话：无key、内部系统会话、正在归档中的会话
             if not key or self._is_internal_session(key) or key in self._archiving:
                 continue
+            # 如果该会话属于当前活跃会话，跳过，不做过期判断
             if key in active_session_keys:
                 continue
+            # 判断会话是否超时过期（对比会话最后更新时间与当前时间）
             if self._is_expired(info.get("updated_at"), now):
+                # 将该会话key加入归档中集合，防止重复发起归档任务
                 self._archiving.add(key)
+                # 把归档会话的协程任务丢入后台异步执行
                 schedule_background(self._archive(key))
 
     async def _archive(self, key: str) -> None:
+        # check_expired 已跳过 dream: 内部会话，这里做防守性兜底
         if self._is_internal_session(key):
             self._archiving.discard(key)
             return
@@ -86,6 +99,7 @@ class AutoCompact:
         """
         # dream: 这类内部会话不走自动归档和摘要缓存，下面的 discard/pop 只是兜底清理残留
         if self._is_internal_session(key):
+            logger.debug("_is_internal_session")
             # check_expired 已跳过 dream:，但以防其他路径漏了
             self._archiving.discard(key)
             self._summaries.pop(key, None)

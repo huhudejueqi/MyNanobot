@@ -225,7 +225,7 @@ class AgentLoop:
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
-
+        # logger.debug("session_ttl_minutes{}",session_ttl_minutes)
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
         # 消息总线：负责接收和分发所有消息
@@ -441,56 +441,93 @@ class AgentLoop:
         self,
         snapshot: ProviderSnapshot,
         *,
-        publish_update: bool = True,
+        publish_update: bool = True,  # 仅关键字传参，默认开启事件推送
         model_preset: str | None = None,
     ) -> None:
-        """Swap model/provider for future turns without disturbing an active one."""
-        provider = snapshot.provider
-        model = snapshot.model
-        context_window_tokens = snapshot.context_window_tokens
+        """
+        切换后续对话轮次使用的模型/服务商配置，不会中断正在执行中的对话任务。
+        说明：本次已经在运行、处理中的请求不受影响，仅下一轮新对话生效新配置。
+        """
+        # 从配置快照取出核心配置
+        provider = snapshot.provider                # LLM服务商名称（openai/anthropic等）
+        model = snapshot.model                      # 目标模型名称（gpt-4o/claude-3等）
+        context_window_tokens = snapshot.context_window_tokens  # 模型上下文窗口最大token数
+
+        # 记录切换前旧模型，用于日志打印对比
         old_model = self.model
-        # LLM provider 和 model
+
+        # 1. 更新自身实例存储的服务商、模型、上下文窗口上限
         self.provider = provider
         self.model = model
         self.context_window_tokens = context_window_tokens
-        self.runner.provider = provider
-        self.subagents.set_provider(provider, model)
-        self.consolidator.set_provider(provider, model, context_window_tokens)
+
+        # 2. 同步更新内部各依赖组件的服务商与模型
+        self.runner.provider = provider                         # 对话执行器
+        self.subagents.set_provider(provider, model)            # 子智能体模块
+        self.consolidator.set_provider(provider, model, context_window_tokens)  # 消息合并处理器
+
+        # 3. 更新当前已生效配置的唯一签名，用于后续判断配置是否变更
         self._provider_signature = snapshot.signature
+
+        # 4. 如果允许推送更新，且存在发布回调，执行模型变更通知回调
         if publish_update and self._runtime_model_publisher is not None:
             self._runtime_model_publisher(
                 self.model,
+                # 优先使用传入的预设标识，无则取实例当前预设
                 model_preset if model_preset is not None else self.model_preset,
             )
+
+        # 5. 发送运行时模型变更事件，供外部监听（UI、埋点、日志等消费）
         if publish_update:
             self._runtime_events().runtime_model_changed(
                 self.model,
                 model_preset if model_preset is not None else self.model_preset,
             )
+
+        # 打印日志：记录模型切换，仅影响下一轮对话
         logger.info("Runtime model switched for next turn: {} -> {}", old_model, model)
 
     def _refresh_provider_snapshot(self) -> None:
+        """刷新服务商/模型配置快照，同步最新配置、更新默认预设标识、维护当前激活模型方案"""
+        # 1. 没有配置快照加载器，直接退出，无需刷新
         if self._provider_snapshot_loader is None:
             return
         try:
+            # 调用加载器拉取最新完整服务商配置快照
             snapshot = self._provider_snapshot_loader()
         except Exception:
+            # 捕获所有异常，打印完整堆栈日志后直接返回，不中断程序
             logger.exception("Failed to refresh provider config")
             return
+
+        # 根据新快照的唯一签名，生成系统默认选中预设的标识
         default_selection = preset_helpers.default_selection_signature(snapshot.signature)
+
+        # 分支1：当前存在激活预设 且 旧默认标识为空 / 和新默认标识一致
         if self._active_preset and self._default_selection_signature in (None, default_selection):
+            # 更新全局默认预设标识为最新生成值
             self._default_selection_signature = default_selection
             try:
+                # 基于当前激活的预设，重新构建专属模型配置快照
                 snapshot = self._build_model_preset_snapshot(self._active_preset)
             except Exception:
+                # 构建激活预设快照失败，记录日志并终止刷新流程
                 logger.exception("Failed to refresh active model preset")
                 return
+        # 分支2：无激活预设，或新旧默认预设标识不一致
         else:
+            # 清空当前激活的模型预设
             self._active_preset = None
+            # 同步更新全局默认预设标识
             self._default_selection_signature = default_selection
+
+        # 快照签名和当前已生效服务商签名完全一致 → 配置无变化，无需更新，直接返回
         if snapshot.signature == self._provider_signature:
             return
+
+        # 重新计算一遍默认预设标识（兼容快照变更后的最新签名）
         self._default_selection_signature = preset_helpers.default_selection_signature(snapshot.signature)
+        # 将最新快照应用到实例，更新内部服务商配置、刷新生效签名
         self._apply_provider_snapshot(snapshot)
 
     @property
@@ -684,7 +721,8 @@ class AgentLoop:
         :param raw: 用户发送的原始命令文本
         :param dispatch_fn: 分发处理异步函数，入参CommandContext，返回回复消息或None
         """
-        # 构造命令上下文，这里会话session暂时传入None，绑定当前事件循环实例self
+        # 构造命令上下文，session 暂时传入 None（命令处理函数按需从 loop.sessions 获取）
+        # loop 指向 AgentLoop 实例，命令处理函数通过它操作任务取消、状态管理等
         ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
         # 执行传入的分发函数，处理命令逻辑，获取返回的回复消息
         result = await dispatch_fn(ctx)
@@ -1546,83 +1584,44 @@ class AgentLoop:
         )
 
     async def _state_restore(self, ctx: TurnContext) -> TurnState:
-        """
-        恢复会话检查点 / 用户未完成对话轮次；同时提取消息内附件文档
-        功能：加载上次中断的会话状态、恢复待处理用户对话、预处理消息媒体资源
-        参数 ctx: TurnContext - 当前一轮对话的上下文对象，封装消息、会话、渠道等全部上下文数据
-        返回 TurnState - 对话轮次状态对象（这里代码实际return字符串"ok"，存在类型标注不一致）
-
-        _state_restore(入参: TurnContext ctx)
-        ├─ 步骤1：提取当前消息 msg = ctx.msg
-        ├─ 步骤2：判断消息是否携带媒体附件 msg.media
-        │  ├─ 分支A：存在媒体
-        │  │  ├─ 调用 _prepare_message_media 处理文本+媒体 → 得到 new_content、image_only
-        │  │  ├─ dataclasses.replace 生成新消息，覆盖 ctx.msg
-        │  │  └─ 更新本地变量 msg = 处理后的新消息
-        │  └─ 分支B：无媒体 → 跳过媒体处理
-        ├─ 步骤3：生成日志预览文本（截取前80字符，超长加省略号）
-        ├─ 步骤4：打印日志：渠道ID、发送人、消息预览
-        ├─ 步骤5：校验会话对象 ctx.session 是否为空
-        │  ├─ 分支A：session为空
-        │  │  └─ 通过 session_key 获取/新建持久会话，赋值给 ctx.session
-        │  └─ 分支B：session已存在 → 跳过创建
-        ├─ 步骤6：触发运行时事件 session_turn_started（标记新一轮对话开始）
-        ├─ 步骤7：持久化当前消息对应的工作空间作用域到会话
-        ├─ 步骤8：恢复运行时断点检查点 _restore_runtime_checkpoint
-        │  ├─ 分支A：恢复后状态变更（返回True）
-        │  │  └─ 保存会话 self.sessions.save(ctx.session)
-        │  └─ 分支B：无变更 → 不保存
-        ├─ 步骤9：恢复未完成用户对话轮次 _restore_pending_user_turn
-        │  ├─ 分支A：恢复后状态变更（返回True）
-        │  │  └─ 保存会话 self.sessions.save(ctx.session)
-        │  └─ 分支B：无变更 → 不保存
-        └─ 步骤10：返回字符串 "ok"
-            补充：类型注解标注返回 TurnState，实际返回字符串，存在类型不匹配问题
-        """
-        # 取出上下文里的用户消息对象
+        """恢复会话检查点、未完成用户轮次；提取附件文档"""
+        # 步骤1：取消息, 步骤2：处理媒体附件
+        # ├─ 有媒体 → _prepare_message_media 提取文档文字 / 剥离图片 → 更新 ctx.msg
+        # └─ 无媒体 → 跳过
         msg = ctx.msg
-
-        # 如果消息携带图片/文件等媒体附件，执行预处理
         if msg.media:
-            # 处理消息正文+媒体资源：转换媒体格式、剥离纯图片资源
             new_content, image_only = self._prepare_message_media(msg.content, msg.media)
-            # 复制一份全新消息对象，替换处理后的正文与媒体字段（dataclasses.replace 不可变数据更新）
             ctx.msg = dataclasses.replace(msg, content=new_content, media=image_only)
-            # 同步更新本地msg变量为处理后的新消息
             msg = ctx.msg
 
-        # 截取消息前80字符做日志预览，过长则末尾拼接省略号
+        # 步骤3-4：日志预览并打印
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        # 打印日志：渠道ID、发送者ID、消息预览内容
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        # 注释说明：上层调用函数 _process_message 理论上已经加载过会话
-        # 此处做兼容兜底：防止该函数被单独调用、会话未初始化的场景
-        # Session = 用户持久会话，存储历史对话、记忆、检查点、配置
-        logger.info("ctx.session start")
+        # 步骤5：确保 session 已加载
+        # ├─ session 为空 → sessions.get_or_create()
+        # └─ session 已存在 → 跳过
         if ctx.session is None:
-            logger.info("ctx.session is None")
-            # 根据会话唯一标识，获取已有会话；不存在则新建空会话
             ctx.session = self.sessions.get_or_create(ctx.session_key)
-        logger.info("ctx.session end")
-        # 触发运行时事件：标记当前会话开启一轮新对话
+
+        # 步骤6：通知运行时事件系统
         await self._runtime_events().session_turn_started(msg, ctx.session_key)
-        # 将本次消息关联的工作空间作用域持久化存入会话（区分多项目/多文件夹隔离）
+        # 步骤7：持久化工作空间作用域到会话
         self.workspace_scopes.persist_message_scope(ctx.session, msg)
 
-        # 1. 恢复运行时断点检查点（Agent中途中断、工具执行一半的上下文）
-        # 函数返回True代表状态发生变更，需要落地保存会话
+        # 步骤8：恢复运行时检查点
+        # ├─ 有变更 → save()
+        # └─ 无变更 → 跳过
         if self._restore_runtime_checkpoint(ctx.session):
-            logger.info("_restore_runtime_checkpoint")
-            self.sessions.save(ctx.session)
-        
-        # 2. 恢复用户未完成的对话轮次（比如上一轮AI回复一半中断、等待用户续聊）
-        # 状态变更则持久化会话数据到磁盘/数据库
-        if self._restore_pending_user_turn(ctx.session):
-            logger.info("_restore_pending_user_turn")
             self.sessions.save(ctx.session)
 
-        # 函数标注返回TurnState，但实际返回字符串"ok"，属于代码小bug/标注疏漏
+        # 步骤9：恢复未完成用户轮次
+        # ├─ 有变更 → save()
+        # └─ 无变更 → 跳过
+        if self._restore_pending_user_turn(ctx.session):
+            self.sessions.save(ctx.session)
+
+        # 步骤10：返回 "ok"（类型注解标注 TurnState，实际返回字符串，不匹配）
         return "ok"
     
     def _prepare_message_media(self, content: str, media: list[str]) -> tuple[str, list[str]]:
@@ -1644,11 +1643,20 @@ class AgentLoop:
         return self.channels_config.extract_document_text
 
     async def _state_compact(self, ctx: TurnContext) -> str:
+        """加载会话摘要：优先读内存缓存，没有就读持久化元数据"""
+        # auto_compact.prepare_session() 读取 _summaries 缓存或 session.metadata["_last_summary"]
+        # ├─ 有摘要 → ctx.pending_summary = 格式化后的摘要文本
+        # └─ 无摘要 → ctx.pending_summary = None
         ctx.session, pending = self.auto_compact.prepare_session(ctx.session, ctx.session_key)
         ctx.pending_summary = pending
         return "ok"
 
     async def _state_command(self, ctx: TurnContext) -> str:
+        """检查消息是否为斜杠命令，匹配成功则直接返回，跳过 BUILD/SAVE/RUN"""
+        # 1. 取出消息文本，构造 CommandContext
+        # 2. 匹配命令路由
+        #    ├─ 匹配成功 → 保存回复到 ctx.outbound，立即持久化 session，返回 "shortcut"
+        #    └─ 匹配失败 → 返回 "dispatch"，继续 BUIL
         raw = ctx.msg.content.strip()
         cmd_ctx = CommandContext(
             msg=ctx.msg, session=ctx.session, key=ctx.session_key, raw=raw, loop=self
@@ -1674,6 +1682,12 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
+        """构建本轮 LLM 调用的完整上下文：历史消息、摘要、工具上下文"""
+        # 1. 非临时会话 → 按 token 数触发记忆合并
+        # 2. 设置工具上下文（渠道、session 信息注入工具）
+        # 3. 准备 initial_messages：系统提示 + 摘要 + 历史 + 工作空间上下文
+        # 4. 持久化用户消息到 session
+        # 5. 构建进度回调 / 重试回调
         if not ctx.ephemeral:
             await self.consolidator.maybe_consolidate_by_tokens(
                 ctx.session,
@@ -1720,6 +1734,12 @@ class AgentLoop:
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
+        """执行 LLM 调用 + 工具调用循环（ReAct），处理流式输出"""
+        # 1. 记录 visible_run_started_at（前端计时条用）
+        # 2. 发 run_status_changed("running") → 前端显示进度条
+        # 3. await _run_agent_loop() → 内部调用 Runner，循环执行 LLM + 工具
+        # 4. 解包返回值写入 ctx
+        # 5. maybe_continue_turn()：检查是否需要内部续跑（如工具未执行完）
         if ctx.visible_run_started_at is None:
             ctx.visible_run_started_at = time.time()
         await self._runtime_events().run_status_changed(
@@ -1754,6 +1774,12 @@ class AgentLoop:
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
+        """持久化本轮对话结果：写入会话历史、触发记忆合并、清理运行时检查点"""
+        # 1. 计算耗时 ctx.turn_latency_ms
+        # 2. _save_turn() → 追加本轮消息到 session
+        # 3. record_turn_latency() → 供 turn_completed 使用
+        # 4. 非临时会话 → 记忆合并 + 文件数量上限清理
+        # 5. 清理运行时检查点 + 持久化 session
         turn_continuation.prepare_save_boundary(ctx)
 
         if (
@@ -1793,6 +1819,10 @@ class AgentLoop:
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:
+        """组装最终回复消息写入 ctx.outbound，等待 _dispatch 推送到总线"""
+        # 1. 如果 suppress_response → 清空 outbound，直接返回
+        # 2. _assemble_outbound() → 构造 OutboundMessage（含 latency_ms、_streamed 标记）
+        # 3. 临时会话 → 标记 _stop_reason
         if ctx.suppress_response:
             ctx.outbound = None
             return "ok"

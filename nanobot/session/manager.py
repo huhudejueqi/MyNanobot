@@ -99,14 +99,14 @@ def _metadata_title(metadata: Any) -> str:
 
 @dataclass
 class Session:
-    """A conversation session."""
+    """单次会话：存储对话历史、元数据、记忆合并偏移量"""
 
-    key: str  # channel:chat_id
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
+    key: str                          # 会话唯一标识，格式 channel:chat_id
+    messages: list[dict[str, Any]] = field(default_factory=list)    # 消息列表，按时间顺序追加，每行一条 JSONL
+    created_at: datetime = field(default_factory=datetime.now)      # 会话创建时间
+    updated_at: datetime = field(default_factory=datetime.now)      # 最后更新时间
+    metadata: dict[str, Any] = field(default_factory=dict)          # 扩展元数据（标题、工作空间、goal状态等）
+    last_consolidated: int = 0                                       # 已合并到记忆文件的条数偏移量
 
     def __post_init__(self) -> None:
         # An out-of-range offset (corrupt metadata) would hide all history; reset it.
@@ -137,7 +137,10 @@ class Session:
         return f"[Message Time: {timestamp}]\n{content}"
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
+        """追加一条消息到会话"""
+        # 1. 构造消息字典: role + content + 时间戳 + 额外参数
+        # 2. append 到 self.messages
+        # 3. 更新 updated_at
         msg = {
             "role": role,
             "content": content,
@@ -154,17 +157,26 @@ class Session:
         max_tokens: int = 0,
         include_timestamps: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input.
+        """返回本轮 LLM 使用的历史消息（截断 + 去除非必要的消息）
 
-        History is sliced by message count first (``max_messages``), then by
-        token budget from the tail (``max_tokens``) when provided.
+        get_history(max_messages, max_tokens, include_timestamps)
+        ├─ 1. 取未合并部分 messages[last_consolidated:]
+        ├─ 2. 按 max_messages 截尾
+        ├─ 3. 对齐到 user turn 开头（前一条是 _channel_delivery 则一并保留）
+        ├─ 4. 丢弃前端孤立的 tool_result
+        └─ 5-7. 逐条处理消息:
+            ├─ 过滤 _command
+            ├─ 注入面包屑: media → [image:路径], cli_apps → [CLI App], mcp_presets → [MCP Preset]
+            ├─ 可选注入时间戳
+            └─ 跳过空内容的 assistant（除非有 tool_calls / reasoning）
+        └─ 8. 按 max_tokens 从尾剪裁 → 重新对齐 user turn → 丢弃孤立 tool_result
         """
         unconsolidated = self.messages[self.last_consolidated:]
         max_messages = max_messages if max_messages > 0 else 120
         sliced = unconsolidated[-max_messages:]
 
-        # Avoid starting mid-turn when possible, except for proactive
-        # assistant deliveries that the user may be replying to.
+        # 3. 对齐到 user turn 开头，避免从 assistant 中间开始
+        #    如果 user turn 前一条是 _channel_delivery（主动推送）则一并保留
         for i, message in enumerate(sliced):
             if message.get("role") == "user":
                 start = i
@@ -173,7 +185,7 @@ class Session:
                 sliced = sliced[start:]
                 break
 
-        # Drop orphan tool results at the front.
+        # 4. 丢弃前端孤立的 tool_result（缺少对应的 tool_call）
         start = find_legal_message_start(sliced)
         if start:
             sliced = sliced[start:]
@@ -186,11 +198,8 @@ class Session:
             role = message.get("role")
             if role == "assistant" and isinstance(content, str):
                 content = _sanitize_assistant_replay_text(content)
-            # Synthesize an ``[image: path]`` breadcrumb from the persisted
-            # ``media`` kwarg so LLM replay still sees *something* where the
-            # image used to be. Without this, an image-only user turn
-            # replays as an empty user message — the assistant's reply then
-            # looks like it's responding to nothing.
+            # 6. 注入面包屑：让 LLM 知道图片/CLI/MCP 附件曾经存在
+            #    纯图片消息如果没面包屑，回放时变成空 user 消息，assistant 的回复就悬空了
             media = message.get("media")
             if role == "user" and isinstance(media, list) and media and isinstance(content, str):
                 breadcrumbs = "\n".join(
@@ -236,8 +245,10 @@ class Session:
                 if mcp_lines:
                     breadcrumbs = "\n".join(mcp_lines)
                     content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
+            # 7. 可选注入时间戳
             if include_timestamps:
                 content = self._annotate_message_time(message, content)
+            # 跳过空内容的 assistant（除非它带了 tool_calls / reasoning）
             if role == "assistant" and isinstance(content, str) and not content.strip():
                 if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
                     continue
@@ -257,15 +268,12 @@ class Session:
                 kept.append(message)
                 used += tokens
             kept.reverse()
-
-            # Keep history aligned to the first visible user turn.
+            # 8. 按 token budget 剪裁后，重新对齐到 user turn 开头
             first_user = next((i for i, m in enumerate(kept) if m.get("role") == "user"), None)
             if first_user is not None:
                 kept = kept[first_user:]
             else:
-                # Tight token budgets can otherwise leave assistant-only tails.
-                # If a user turn exists in the unsliced output, recover the
-                # nearest one even if it slightly exceeds the token budget.
+                # budget 太紧可能只剩 assistant 尾巴，从原始列表找回最近的 user turn
                 recovered_user = next(
                     (i for i in range(len(out) - 1, -1, -1) if out[i].get("role") == "user"),
                     None,
@@ -273,7 +281,7 @@ class Session:
                 if recovered_user is not None:
                     kept = out[recovered_user:]
 
-            # And keep a legal tool-call boundary at the front.
+            # 丢弃前端孤立的 tool_result（已做剪裁，但 budget 边界可能出现新的孤立）
             start = find_legal_message_start(kept)
             if start:
                 kept = kept[start:]
@@ -281,7 +289,9 @@ class Session:
         return out
 
     def clear(self) -> None:
-        """Clear all messages and reset session to initial state."""
+        """清空所有消息，重置会话到初始状态"""
+        # last_consolidated 重置为 0
+        # 清除 _last_summary 缓存摘要
         self.messages = []
         self.last_consolidated = 0
         self.updated_at = datetime.now()
@@ -380,7 +390,11 @@ class Session:
         on_archive: Any = None,
         limit: int = FILE_MAX_MESSAGES,
     ) -> None:
-        """Bound session message growth by archiving and trimming old prefixes."""
+        """限制消息总数：超出 limit 时归档旧消息并截断"""
+        # 1. 未超 limit → 跳过
+        # 2. retain_recent_legal_suffix() 截断
+        # 3. 已合并部分不重复归档
+        # 4. 未合并部分传给 on_archive 回调
         if limit <= 0 or len(self.messages) <= limit:
             return
 
@@ -427,15 +441,11 @@ class SessionManager:
         return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"
 
     def get_or_create(self, key: str) -> Session:
-        """
-        Get an existing session or create a new one.
-
-        Args:
-            key: Session key (usually channel:chat_id).
-
-        Returns:
-            The session.
-        """
+        """获取已有会话，不存在则新建"""
+        # 1. 内存缓存命中 → 直接返回
+        # 2. 缓存未命中 → 从磁盘加载
+        # 3. 磁盘也不存在 → 创建全新空 Session
+        # 4. 写入缓存后返回
         if key in self._cache:
             return self._cache[key]
 
@@ -447,7 +457,15 @@ class SessionManager:
         return session
 
     def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
+        """从磁盘 JSONL 文件加载会话"""
+        # 1. 拼接 session 文件路径
+        # 2. 新路径不存在 → 尝试旧路径迁移
+        # 3. 新旧都不存在 → 返回 None
+        # 4. 有文件 → 逐行解析 JSONL
+        # 5. 首行 _type=metadata → 提取元数据 + 时间戳
+        # 6. 其余行 → 追加到 messages
+        # 7. 构造 Session 对象返回
+        # 8. 解析失败 → 尝试 _repair 修复
         path = self._get_session_path(key)
         if not path.exists():
             legacy_path = self._get_legacy_session_path(key)
@@ -576,7 +594,7 @@ class SessionManager:
         """
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
-
+        # logger.debug(path)
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 metadata_line = {
