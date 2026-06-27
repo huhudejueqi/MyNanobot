@@ -1,5 +1,6 @@
-"""基于原始终端模式的异步行编辑器，支持方向键和历史。"""
+"""CLI 模块：交互终端、流式渲染、命令行编辑器。"""
 
 from nanobot.cli.cli_reader import AsyncCli, CliConfig
+from nanobot.cli.stream import StreamRenderer
 
-__all__ = ["AsyncCli", "CliConfig"]
+__all__ = ["AsyncCli", "CliConfig", "StreamRenderer"]

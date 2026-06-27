@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any, Awaitable, Callable, Coroutine
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.config.loader import Config
@@ -55,6 +55,8 @@ class TurnContext:
     all_messages: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = ""
     outbound: OutboundMessage | None = None
+    on_stream: Callable[[str], Awaitable[None]] | None = None
+    on_stream_end: Callable[..., Awaitable[None]] | None = None
     turn_wall_started_at: float = field(default_factory=time.time)
     trace: list[StateTraceEntry] = field(default_factory=list)
     error: str | None = None
@@ -200,12 +202,16 @@ class AgentLoop:
         self,
         msg: InboundMessage,
         session_key: str | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """状态机驱动：RESTORE → COMPACT → ... → DONE，返回出站消息。"""
         key = session_key or msg.session_key
         ctx = TurnContext(
             msg=msg, session_key=key, state=TurnState.RESTORE,
             turn_wall_started_at=time.time(),
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
         )
 
         while ctx.state is not TurnState.DONE:
@@ -240,13 +246,38 @@ class AgentLoop:
             "dispatch: session=%s, content=%.60s", session_key, msg.content,
         )
 
+        # 流式回调：当客户端声明 _wants_stream 时，逐 chunk 通过 bus 推送
+        on_stream = on_stream_end = None
+        if msg.metadata.get("_wants_stream"):
+            async def _on_stream(delta: str) -> None:
+                meta = dict(msg.metadata or {})
+                meta["_stream_delta"] = True
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=delta, metadata=meta,
+                ))
+
+            async def _on_stream_end(*, resuming: bool = False) -> None:
+                meta = dict(msg.metadata or {})
+                meta["_stream_end"] = True
+                meta["_resuming"] = resuming
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="", metadata=meta,
+                ))
+
+            on_stream = _on_stream
+            on_stream_end = _on_stream_end
+
         try:
             async with lock:
-                outbound = await self._process_message(msg, session_key=session_key)
+                outbound = await self._process_message(
+                    msg, session_key=session_key,
+                    on_stream=on_stream, on_stream_end=on_stream_end,
+                )
                 if outbound is not None:
                     await self.bus.publish_outbound(outbound)
                 elif msg.channel == "cli":
-                    # CLI 渠道：无回复也发空消息，避免主循环死等
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id, content="",
                     ))
@@ -311,41 +342,61 @@ class AgentLoop:
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
-        logger.info("RUN: model=%s, messages=%d", self.model, len(ctx.all_messages))
+        logger.info("RUN: model=%s, messages=%d, stream=%s",
+                     self.model, len(ctx.all_messages), ctx.on_stream is not None)
         if self.on_llm_start:
             await self.on_llm_start()
         try:
             t0 = time.time()
-            response = await self.provider.chat(
-                messages=ctx.all_messages, model=self.model,
-            )
+
+            if ctx.on_stream is not None:
+                # 流式模式：逐 chunk 推送
+                buf: list[str] = []
+                async for delta in self.provider.chat_stream(
+                    messages=ctx.all_messages, model=self.model,
+                ):
+                    if delta.content:
+                        buf.append(delta.content)
+                        await ctx.on_stream(delta.content)
+                    if delta.finish_reason:
+                        ctx.stop_reason = delta.finish_reason
+                ctx.final_content = "".join(buf)
+                if ctx.stop_reason in ("timeout", "error"):
+                    err = ctx.stop_reason
+                    ctx.final_content = f"[LLM 调用失败: {err}]" if not ctx.final_content else ctx.final_content
+            else:
+                # 非流式模式：一次性返回
+                response = await self.provider.chat(
+                    messages=ctx.all_messages, model=self.model,
+                )
+                ctx.final_content = response.content or ""
+                ctx.stop_reason = response.finish_reason
+                if response.finish_reason == "error":
+                    err = response.usage.get("error", "unknown")
+                    ctx.final_content = f"[LLM 调用失败: {err}]"
+                    return "ok"
+                if response.tool_calls:
+                    for tc in response.tool_calls:
+                        ctx.tools_used.append(tc.name)
+                        ctx.all_messages.append({
+                            "role": "assistant", "content": None,
+                            "tool_calls": [{
+                                "id": tc.id, "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": tc.arguments if isinstance(tc.arguments, str)
+                                    else json.dumps(tc.arguments),
+                                },
+                            }],
+                        })
+                        ctx.all_messages.append({
+                            "role": "tool", "tool_call_id": tc.id,
+                            "content": f"[工具 {tc.name} 已执行，结果待实现]",
+                        })
+
             elapsed = time.time() - t0
-            ctx.final_content = response.content or ""
-            ctx.stop_reason = response.finish_reason
             logger.info("LLM 返回: finish_reason=%s, %.1fs, %d chars",
-                        response.finish_reason, elapsed, len(ctx.final_content))
-            if response.finish_reason == "error":
-                err = response.usage.get("error", "unknown")
-                ctx.final_content = f"[LLM 调用失败: {err}]"
-                return "ok"
-            if response.tool_calls:
-                for tc in response.tool_calls:
-                    ctx.tools_used.append(tc.name)
-                    ctx.all_messages.append({
-                        "role": "assistant", "content": None,
-                        "tool_calls": [{
-                            "id": tc.id, "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments if isinstance(tc.arguments, str)
-                                else json.dumps(tc.arguments),
-                            },
-                        }],
-                    })
-                    ctx.all_messages.append({
-                        "role": "tool", "tool_call_id": tc.id,
-                        "content": f"[工具 {tc.name} 已执行，结果待实现]",
-                    })
+                        ctx.stop_reason, elapsed, len(ctx.final_content or ""))
         except Exception as e:
             ctx.error = str(e)
             logger.error("LLM 异常: %s", e)
@@ -353,6 +404,9 @@ class AgentLoop:
         finally:
             if self.on_llm_end:
                 await self.on_llm_end()
+            # 流式结束回调
+            if ctx.on_stream_end:
+                await ctx.on_stream_end(resuming=False)
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
@@ -363,9 +417,13 @@ class AgentLoop:
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:
+        metadata: dict[str, Any] = {}
+        if ctx.on_stream is not None:
+            metadata["_streamed"] = True
         ctx.outbound = OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content=ctx.final_content or "",
+            metadata=metadata,
         )
         return "ok"
 

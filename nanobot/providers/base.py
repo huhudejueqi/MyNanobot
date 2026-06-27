@@ -11,6 +11,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from collections.abc import AsyncIterator
 from typing import Any
 
 
@@ -57,6 +58,18 @@ class LLMResponse:
         return len(self.tool_calls) > 0
 
 
+@dataclass
+class StreamDelta:
+    """流式响应中的单个增量片段。
+
+    Attributes:
+        content: 本次增量的文本内容
+        finish_reason: 结束原因，最后一个 delta 会携带此值
+    """
+    content: str = ""
+    finish_reason: str | None = None
+
+
 class LLMProvider(ABC):
     """LLM provider 抽象基类。
 
@@ -97,6 +110,24 @@ class LLMProvider(ABC):
             LLMResponse 统一响应
         """
         ...
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[StreamDelta]:
+        """流式聊天补全，默认回退到非流式 chat()。
+
+        子类可覆盖此方法以原生支持 SSE 流式输出。
+        默认实现调用 chat() 后一次性 yield 完整结果。
+        """
+        response = await self.chat(
+            messages=messages, model=model,
+            max_tokens=max_tokens, temperature=temperature,
+        )
+        yield StreamDelta(content=response.content or "", finish_reason=response.finish_reason)
 
     @abstractmethod
     def get_default_model(self) -> str:
