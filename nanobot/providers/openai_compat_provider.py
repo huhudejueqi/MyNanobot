@@ -86,8 +86,8 @@ class OpenAICompatProvider(LLMProvider):
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         try:
-            # 发送 HTTP 请求，超时 30 秒
-            async with httpx.AsyncClient(timeout=30.0, proxy=None, trust_env=False) as client:
+            # 发送 HTTP 请求，超时 120 秒
+            async with httpx.AsyncClient(timeout=120.0, proxy=None, trust_env=False) as client:
                 resp = await client.post(
                     f"{self.api_base.rstrip('/')}/chat/completions",
                     headers=headers,

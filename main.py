@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,34 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 CLI_COMMANDS = ["/new", "/list", "/switch", "/help", "/exit",
                 "/ping", "/time", "/version"]
 
+def parse_media_input(text: str) -> tuple[str, list[str], list[str]]:
+    """解析 @filepath 语法，返回 (cleaned_text, media_list, warnings)。
+
+    语法：
+        @/path/to/file       简单路径
+        @"/path with spaces"  含空格的路径用引号包裹
+
+    @ 前面必须是行首或空格，避免误匹配邮箱地址等。
+    文件不存在时加入 warnings 列表。
+    """
+    media: list[str] = []
+    warnings: list[str] = []
+    pattern = r'(?:^|\s)@(?:("[^"]+")|(\S+))'
+
+    def _replacer(m: re.Match) -> str:
+        prefix = m.group(0)[0] if m.group(0)[0] == ' ' else ''
+        path = m.group(1).strip('"') if m.group(1) else m.group(2)
+        if os.path.isfile(path):
+            media.append(os.path.abspath(path))
+        else:
+            warnings.append(f'文件不存在: {path}')
+        return prefix
+
+    cleaned = re.sub(pattern, _replacer, text).strip()
+    cleaned = ' '.join(cleaned.split())
+    return cleaned, media, warnings
+
+
 def tab_completer(text: str) -> list[str]:
     if not text.startswith("/"):
         return []
@@ -39,6 +69,7 @@ def print_banner():
     print("  MyNanobot - 个人 AI 助手")
     print("=" * 50)
     print("  输入消息开始对话")
+    print("  @/路径   附加文件（如 @/tmp/test.png）")
     print("  /new     新建对话")
     print("  /list    列出所有对话")
     print("  /switch  切换到指定对话")
@@ -133,14 +164,23 @@ async def main():
                         "可用命令: /new, /list, /switch <n>, "
                         "/ping, /time, /version, /help, /exit"
                     )
+                    cli.output('附件: @/path/to/file 或 @"含空格的路径"')
                     cli.output("键盘: ↑↓ 历史  ←→ 光标  Tab 补全  Ctrl+D 退出")
+                    continue
+
+                # 解析 @filepath 附件语法
+                content, media, warnings = parse_media_input(text)
+                for w in warnings:
+                    cli.output(f"[警告] {w}")
+                if not content and not media:
                     continue
 
                 await agent.bus.publish_inbound(InboundMessage(
                     channel="cli",
                     sender_id=f"cli_user_{session_ts}",
                     chat_id=current_chat_id(),
-                    content=text,
+                    content=content,
+                    media=media,
                 ))
                 reply = await agent.bus.consume_outbound()
                 cli.output(reply.content)

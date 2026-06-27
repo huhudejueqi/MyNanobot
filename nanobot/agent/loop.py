@@ -243,8 +243,13 @@ class AgentLoop:
         try:
             async with lock:
                 outbound = await self._process_message(msg, session_key=session_key)
-                if outbound and outbound.content:
+                if outbound is not None:
                     await self.bus.publish_outbound(outbound)
+                elif msg.channel == "cli":
+                    # CLI 渠道：无回复也发空消息，避免主循环死等
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id, content="",
+                    ))
         except asyncio.CancelledError:
             logger.info("会话 %s 的任务被取消", session_key)
             raise
@@ -260,6 +265,12 @@ class AgentLoop:
         if session is None:
             self._session_store[ctx.session_key] = []
             session = self._session_store[ctx.session_key]
+        msg = ctx.msg
+        if msg.media:
+            logger.debug("开始处理msg.media: %s", msg.media)
+            # new_content, image_only = self._prepare_message_media(msg.content, msg.media)
+            # ctx.msg = dataclasses.replace(msg, content=new_content, media=image_only)
+            msg = ctx.msg
         ctx.session = {"key": ctx.session_key, "messages": session}
         ctx.history = list(session)
         return "ok"
