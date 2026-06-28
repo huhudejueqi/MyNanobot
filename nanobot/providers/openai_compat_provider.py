@@ -88,8 +88,8 @@ class OpenAICompatProvider(LLMProvider):
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         try:
-            # 分段超时：连接 30s，读取 300s
-            timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
+            # 分段超时：连接 120s，读取 300s
+            timeout = httpx.Timeout(connect=120.0, read=300.0, write=120.0, pool=30.0)
             async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False) as client:
                 resp = await client.post(
                     f"{self.api_base.rstrip('/')}/chat/completions",
@@ -216,8 +216,8 @@ class OpenAICompatProvider(LLMProvider):
         url = f"{self.api_base.rstrip('/')}/chat/completions"
 
         try:
-            # 分段超时：连接 30s，chunk 间等待 300s（模型可能思考很久才开始输出）
-            timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
+            # 分段超时：连接 120s，chunk 间等待 300s
+            timeout = httpx.Timeout(connect=120.0, read=300.0, write=120.0, pool=30.0)
             async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False) as client:
                 # client.stream() 不会一次性下载整个响应体，
                 # 而是建立连接后通过 aiter_lines() 逐行读取 SSE 事件

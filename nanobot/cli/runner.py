@@ -114,17 +114,12 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
         completer=tab_completer,
     )
 
-    renderer: StreamRenderer | None = None
-
     try:
         async with AsyncCli(cli_config) as cli:
             agent.on_llm_start = _make_on_llm_start()
             agent.on_llm_end = _make_on_llm_end()
 
             while True:
-                # 上一轮的 renderer 清理
-                if renderer:
-                    renderer.stop_for_input()
 
                 text = await cli.readline()
                 text = text.strip()
@@ -180,13 +175,6 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
                 if not content and not media:
                     continue
 
-                # ── 创建本轮 StreamRenderer ──
-                renderer = StreamRenderer(
-                    render_markdown=True,
-                    bot_name="MyNanobot",
-                    bot_icon="🤖",
-                )
-
                 # ── 发送消息并等待回复 ──
                 turn_done = asyncio.Event()
                 turn_content: list[str] = []
@@ -204,24 +192,24 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
 
                         meta = msg.metadata or {}
 
-                        # 流式增量
                         if meta.get("_stream_delta"):
-                            await renderer.on_delta(msg.content)
+                            stream_started = True
+                            # raw 终端下直接输出，不用 Rich Live
+                            write = msg.content.replace("\n", "\r\n")
+                            sys.stdout.write(write)
+                            sys.stdout.flush()
                             continue
 
-                        # 流式结束
                         if meta.get("_stream_end"):
-                            await renderer.on_end(
-                                resuming=meta.get("_resuming", False),
-                            )
+                            if stream_started:
+                                sys.stdout.write("\r\n")
+                                sys.stdout.flush()
                             continue
 
-                        # 标记已流式发送的最终回复
                         if meta.get("_streamed"):
                             turn_done.set()
                             continue
 
-                        # 非流式最终回复
                         if msg.content:
                             turn_content.append(msg.content)
                             turn_metadata.update(meta)
@@ -235,14 +223,13 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
                     chat_id=current_chat_id(),
                     content=content,
                     media=media,
-
+                    metadata={"_wants_stream": True},
                 ))
 
                 await turn_done.wait()
 
                 # 非流式回复：用 Rich 渲染
-                if turn_content and not renderer.streamed:
-                    await renderer.close()
+                if turn_content:
                     from rich.console import Console
                     from rich.markdown import Markdown
                     c = Console(file=sys.stdout)
@@ -250,8 +237,6 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
                     c.print("[cyan]🤖 MyNanobot[/cyan]")
                     c.print(Markdown(turn_content[0]))
                     c.print()
-                elif not renderer.streamed:
-                    await renderer.close()
 
                 consumer.cancel()
                 try:
@@ -262,8 +247,6 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
-        if renderer:
-            await renderer.close()
         await agent.stop()
         print("\r\nMyNanobot 已停止。")
 
