@@ -13,7 +13,10 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine
 
+import base64
+
 from nanobot.agent.context import ContextBuilder
+from nanobot.utils.document import extract_documents, is_image_file
 from nanobot.config.loader import Config
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -298,10 +301,18 @@ class AgentLoop:
             session = self._session_store[ctx.session_key]
         msg = ctx.msg
         if msg.media:
-            logger.debug("开始处理msg.media: %s", msg.media)
-            # new_content, image_only = self._prepare_message_media(msg.content, msg.media)
-            # ctx.msg = dataclasses.replace(msg, content=new_content, media=image_only)
+            logger.info("处理 media: %d 个附件", len(msg.media))
+            # 分离图片和文档：文档抽取文字拼入 content，图片留在 media 列表
+            new_content, image_only = extract_documents(msg.content, msg.media)
+            # 更新消息内容（含文档提取的文字）和 media（仅图片）
+            ctx.msg = msg.__class__(
+                channel=msg.channel, sender_id=msg.sender_id, chat_id=msg.chat_id,
+                content=new_content, media=image_only,
+                timestamp=msg.timestamp, metadata=msg.metadata,
+            )
             msg = ctx.msg
+            if image_only:
+                logger.info("图片附件: %s", image_only)
         ctx.session = {"key": ctx.session_key, "messages": session}
         ctx.history = list(session)
         return "ok"
@@ -337,7 +348,34 @@ class AgentLoop:
 
     async def _state_build(self, ctx: TurnContext) -> str:
         messages = list(ctx.history)
-        messages.append({"role": "user", "content": ctx.msg.content})
+        content_text = ctx.msg.content
+        media = ctx.msg.media
+
+        if media:
+            # 多模态消息：content 为数组，包含 text + image_url
+            content_blocks: list[dict] = []
+            if content_text:
+                content_blocks.append({"type": "text", "text": content_text})
+            for img_path in media:
+                try:
+                    p = Path(img_path)
+                    with open(p, "rb") as f:
+                        img_data = f.read()
+                    mime = self._detect_image_mime(img_data[:16])
+                    if not mime:
+                        mime = "image/png"
+                    b64 = base64.b64encode(img_data).decode("ascii")
+                    content_blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    })
+                except Exception as e:
+                    logger.warning("图片读取失败 %s: %s", img_path, e)
+                    if content_text:
+                        content_blocks.append({"type": "text", "text": f"[图片加载失败: {img_path}]"})
+            messages.append({"role": "user", "content": content_blocks})
+        else:
+            messages.append({"role": "user", "content": content_text})
         ctx.all_messages = messages
         return "ok"
 
@@ -415,6 +453,19 @@ class AgentLoop:
             session.append({"role": "user", "content": ctx.msg.content})
             session.append({"role": "assistant", "content": ctx.final_content})
         return "ok"
+
+    @staticmethod
+    def _detect_image_mime(data: bytes) -> str | None:
+        """从文件头部字节检测图片 MIME 类型。"""
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if data[:2] in (b"\xff\xd8",):
+            return "image/jpeg"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        return None
 
     async def _state_respond(self, ctx: TurnContext) -> str:
         metadata: dict[str, Any] = {}
