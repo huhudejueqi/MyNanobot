@@ -182,6 +182,7 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
 
                 async def _consume_outbound() -> None:
                     """消费 bus 上的 outbound 消息，处理流式 delta 和最终回复。"""
+                    stream_started = False
                     while not turn_done.is_set():
                         try:
                             msg = await asyncio.wait_for(
@@ -205,8 +206,12 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
                                 sys.stdout.write("\r\n")
                                 sys.stdout.flush()
                             continue
-
                         if meta.get("_streamed"):
+                            # 流式模式下内容已通过 _stream_delta 实时输出
+                            # 仅当未产生任何流式输出（如超时/错误）时，才兜底显示
+                            if not stream_started and msg.content:
+                                turn_content.append(msg.content)
+                                turn_metadata.update(meta)
                             turn_done.set()
                             continue
 

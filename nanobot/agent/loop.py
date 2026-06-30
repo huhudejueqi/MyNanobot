@@ -16,6 +16,10 @@ from typing import Any, Awaitable, Callable, Coroutine
 import base64
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.runner import AgentRunner
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.shell import ShellTool
+from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
 from nanobot.utils.document import extract_documents, is_image_file
 from nanobot.config.loader import Config
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -67,42 +71,83 @@ class TurnContext:
 
 class AgentLoop:
     """AgentLoop 是 MyNanobot 的核心处理引擎。
-
-    状态机执行树（原版模式）：
+    状态机执行树：
                      消息到达 _dispatch()
                            │
-                    ┌──────▼──────┐
-                    │  RESTORE    │
-                    │  "ok"       │
-                    └──────┬──────┘
-                    ┌──────▼──────┐
-                    │  COMPACT    │
-                    │  "ok"       │
-                    └──────┬──────┘
-                    ┌──────▼──────┐
-                    │  COMMAND    │
-                    │  /     \\    │
-                shortcut    dispatch
-                    │          │
-               ┌────▼───┐ ┌───▼────┐
-               │  DONE   │ │  BUILD │
-               │         │ │ "ok"   │
-               └─────────┘ └───┬────┘
-                           ┌───▼────┐
-                           │  RUN   │
-                           │ "ok"   │
-                           └───┬────┘
-                        ┌──────▼──────┐
-                        │    SAVE     │
-                        │   "ok"     │
-                        └──────┬──────┘
-                        ┌──────▼──────┐
-                        │   RESPOND   │
-                        │   "ok"     │
-                        └──────┬──────┘
-                        ┌──────▼──────┐
-                        │    DONE     │◄── 任意 "error" 也跳到这里
-                        └─────────────┘
+               ┌──────▼────────────────────────┐
+               │  RESTORE                      │
+               │  ├─ 查找/创建 session          │
+               │  ├─ 解析附件：                 │
+               │  │   文档 → 提取文字拼入 content│
+               │  │   图片 → 留在 media 列表    │
+               │  └─ 初始化 ctx.history         │
+               │  "ok"                          │
+               └──────┬─────────────────────────┘
+                      │
+               ┌──────▼────────────────────────┐
+               │  COMPACT                      │
+               │  ├─ 检查消息数 > 60            │
+               │  └─ 是 → 截断保留后半          │
+               │  "ok"                          │
+               └──────┬─────────────────────────┘
+                      │
+               ┌──────▼────────────────────────┐
+               │  COMMAND                      │
+               │  ├─ 遍历 _handlers 匹配        │
+               │  ├─ 匹配 /ping /time /version  │
+               │  └─ 匹配 → shortcut / 否则 dispatch
+               └──────┬──────┬──────────────────┘
+                      │      │
+                 shortcut dispatch
+                      │      │
+                   ┌──▼──┐ ┌──▼────────────────────┐
+                   │DONE │ │  BUILD                │
+                   │     │ │  ├─ 拷贝 history      │
+                   └─────┘ │  ├─ 有图片 media？     │
+                           │  │   是 → base64 编码  │
+                           │  │    → 多模态 content │
+                           │  │   否 → 纯文本追加   │
+                           │  └─ 构建 all_messages │
+                           │  "ok"                 │
+                           └──┬────────────────────┘
+                              │
+               ┌──────────────▼──────────────────────────────┐
+               │  RUN (ReAct 循环)                            │
+               │                                              │
+               │  委托 AgentRunner.run()                       │
+               │  ┌──────────────────────────────────────┐    │
+               │  │  LLM call                             │    │
+               │  │  ├─ 首轮+流式 → chat_stream()         │    │
+               │  │  └─ 后续/非流式 → chat()              │    │
+               │  └──────────┬───────────────────────────┘    │
+               │             │                                │
+               │  ┌──────────▼───────────────────────────┐    │
+               │  │  tool_calls?                          │    │
+               │  │  ├─ 是 → 执行工具 → 拼接结果 → 继续   │    │
+               │  │  └─ 否 → 返回最终回复                  │    │
+               │  └──────────────────────────────────────┘    │
+               │ "ok"                    "error"              │
+               └──┬──────────────────────────┬────────────────┘
+                  │                          │
+               ┌──▼──────────────────┐  ┌───▼──────┐
+               │  SAVE                │  │  DONE    │
+               │  ├─ 追加 user msg    │  │ (error)  │
+               │  └─ 追加 assistant   │  └──────────┘
+               │  msg 到 session      │
+               │  "ok"                │
+               └──┬───────────────────┘
+                  │
+               ┌──▼──────────────────┐  ┌──────────┐
+               │  RESPOND             │  │  DONE    │
+               │  ├─ 标记 _streamed   │──│ (error)  │
+               │  ├─ 组装 OutboundMsg │  └──────────┘
+               │  └─ 写入 ctx.outbound│
+               │  "ok"                │
+               └──┬───────────────────┘
+                  │
+               ┌──▼────┐
+               │  DONE  │
+               └────────┘
     """
 
     _TRANSITIONS: dict[tuple[TurnState, str], TurnState] = {
@@ -130,6 +175,7 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         context_window_tokens: int = 128_000,
+        max_iterations: int = 10,
         on_llm_start: Callable[[], Coroutine] | None = None,
         on_llm_end: Callable[[], Coroutine] | None = None,
     ):
@@ -150,6 +196,15 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self._pending_queues: dict[str, asyncio.Queue] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
+
+        # 工具系统
+        self.tools = ToolRegistry()
+        self.runner = AgentRunner(
+            provider=self.provider, max_iterations=max_iterations or 10,
+            on_progress=self._on_tool_progress,
+        )
+        self.max_iterations = max_iterations or 10
+        self._register_default_tools()
 
         logger.info("初始化: model=%s, provider=%s", model, type(provider).__name__)
 
@@ -294,6 +349,17 @@ class AgentLoop:
                 content="抱歉，处理请求时出现异常。",
             ))
 
+    def _register_default_tools(self) -> None:
+        """注册内置工具。"""
+        self.tools.register(ShellTool())
+        self.tools.register(ReadFileTool())
+        self.tools.register(WriteFileTool())
+        logger.info("已注册 %d 个工具: %s", len(self.tools.tool_names), self.tools.tool_names)
+
+    async def _on_tool_progress(self, msg: str) -> None:
+        """工具执行进度回调。"""
+        logger.info("工具进度: %s", msg)
+
     async def _state_restore(self, ctx: TurnContext) -> str:
         session = self._session_store.get(ctx.session_key)
         if session is None:
@@ -380,61 +446,33 @@ class AgentLoop:
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
-        logger.info("RUN: model=%s, messages=%d, stream=%s",
-                     self.model, len(ctx.all_messages), ctx.on_stream is not None)
+        logger.info("RUN: model=%s, messages=%d, tools=%s",
+                     self.model, len(ctx.all_messages),
+                     self.tools.tool_names if self.tools.tool_names else "无")
         if self.on_llm_start:
             await self.on_llm_start()
         try:
             t0 = time.time()
 
-            if ctx.on_stream is not None:
-                # 流式模式：逐 chunk 推送
-                buf: list[str] = []
-                async for delta in self.provider.chat_stream(
-                    messages=ctx.all_messages, model=self.model,
-                ):
-                    if delta.content:
-                        buf.append(delta.content)
-                        await ctx.on_stream(delta.content)
-                    if delta.finish_reason:
-                        ctx.stop_reason = delta.finish_reason
-                ctx.final_content = "".join(buf)
-                if ctx.stop_reason in ("timeout", "error"):
-                    err = ctx.stop_reason
-                    ctx.final_content = f"[LLM 调用失败: {err}]" if not ctx.final_content else ctx.final_content
-            else:
-                # 非流式模式：一次性返回
-                response = await self.provider.chat(
-                    messages=ctx.all_messages, model=self.model,
-                )
-                ctx.final_content = response.content or ""
-                ctx.stop_reason = response.finish_reason
-                if response.finish_reason == "error":
-                    err = response.usage.get("error", "unknown")
-                    ctx.final_content = f"[LLM 调用失败: {err}]"
-                    return "ok"
-                if response.tool_calls:
-                    for tc in response.tool_calls:
-                        ctx.tools_used.append(tc.name)
-                        ctx.all_messages.append({
-                            "role": "assistant", "content": None,
-                            "tool_calls": [{
-                                "id": tc.id, "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": tc.arguments if isinstance(tc.arguments, str)
-                                    else json.dumps(tc.arguments),
-                                },
-                            }],
-                        })
-                        ctx.all_messages.append({
-                            "role": "tool", "tool_call_id": tc.id,
-                            "content": f"[工具 {tc.name} 已执行，结果待实现]",
-                        })
+            # 刷新 runner 的流式回调
+            self.runner.on_stream = ctx.on_stream
+            self.runner.on_stream_end = ctx.on_stream_end
+
+            # 使用 AgentRunner 执行 ReAct 循环
+            result = await self.runner.run(
+                messages=ctx.all_messages,
+                tools=self.tools,
+                model=self.model,
+            )
+            ctx.final_content = result.final_content
+            ctx.stop_reason = result.stop_reason
+            ctx.tools_used = result.tools_used
+            ctx.all_messages = result.all_messages
 
             elapsed = time.time() - t0
-            logger.info("LLM 返回: finish_reason=%s, %.1fs, %d chars",
-                        ctx.stop_reason, elapsed, len(ctx.final_content or ""))
+            logger.info("LLM 返回: finish_reason=%s, %.1fs, %d chars, tools=%s",
+                        ctx.stop_reason, elapsed, len(ctx.final_content or ""),
+                        ctx.tools_used)
         except Exception as e:
             ctx.error = str(e)
             logger.error("LLM 异常: %s", e)
@@ -442,7 +480,6 @@ class AgentLoop:
         finally:
             if self.on_llm_end:
                 await self.on_llm_end()
-            # 流式结束回调
             if ctx.on_stream_end:
                 await ctx.on_stream_end(resuming=False)
         return "ok"

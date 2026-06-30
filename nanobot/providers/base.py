@@ -58,16 +58,18 @@ class LLMResponse:
         return len(self.tool_calls) > 0
 
 
-@dataclass
 class StreamDelta:
-    """流式响应中的单个增量片段。
+    def __init__(self, content: str = "", finish_reason: str | None = None, tool_calls: list | None = None):
+        self.content = content
+        self.finish_reason = finish_reason
+        self.tool_calls = tool_calls or []
 
-    Attributes:
-        content: 本次增量的文本内容
-        finish_reason: 结束原因，最后一个 delta 会携带此值
+    """流式响应中的单个增量片段。
+        tool_calls: 末帧携带完整的工具调用列表
     """
     content: str = ""
     finish_reason: str | None = None
+    tool_calls: list = []  # 末帧携带完整的工具调用列表
 
 
 class LLMProvider(ABC):
@@ -114,6 +116,7 @@ class LLMProvider(ABC):
     async def chat_stream(
         self,
         messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
@@ -126,6 +129,7 @@ class LLMProvider(ABC):
         response = await self.chat(
             messages=messages, model=model,
             max_tokens=max_tokens, temperature=temperature,
+            tools=tools,
         )
         yield StreamDelta(content=response.content or "", finish_reason=response.finish_reason)
 
