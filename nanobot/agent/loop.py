@@ -558,9 +558,10 @@ class AgentLoop:
 
     async def _state_save(self, ctx: TurnContext) -> str:
         session = self._session_store.get(ctx.session_key)
-        if session is not None and ctx.final_content:
-            session.append({"role": "user", "content": ctx.msg.content})
-            session.append({"role": "assistant", "content": ctx.final_content})
+        if session is not None and ctx.all_messages:
+            # 保存完整上下文（含 tool_calls、tool_results）
+            session.clear()
+            session.extend(ctx.all_messages)
         return "ok"
 
     @staticmethod

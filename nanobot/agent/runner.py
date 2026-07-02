@@ -36,6 +36,23 @@ class AgentRunResult:
     had_tool_calls: bool = False
 
 
+def build_assistant_message(
+    content: str | None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    reasoning_content: str | None = None,
+    thinking_blocks: list[dict] | None = None,
+) -> dict[str, Any]:
+    """构建 provider-safe 的 assistant 消息，可选推理内容。"""
+    msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    if reasoning_content is not None or thinking_blocks:
+        msg["reasoning_content"] = reasoning_content if reasoning_content is not None else ""
+    if thinking_blocks:
+        msg["thinking_blocks"] = thinking_blocks
+    return msg
+
+
 class AgentRunner:
     """执行 LLM 多轮 ReAct 循环的核心引擎。
 
@@ -71,39 +88,105 @@ class AgentRunner:
         tools: ToolRegistry,
         model: str | None = None,
     ) -> AgentRunResult:
-        """执行 ReAct 循环。
+        """Agent 运行入口：hook 包装层，委托 _run_core 执行 ReAct 循环。
 
-        首轮 LLM 调用尝试流式（若 on_stream 非空），
-        工具后续轮次走非流式 chat()。
+        ┌────────────────────────────────────────────────┐
+        │  run()                                         │
+        ├────────────────────────────────────────────────┤
+        │                                                │
+        │  run_hctx = AgentRunHookContext(messages)       │
+        │  hook.before_run(run_hctx)                      │
+        │       │                                         │
+        │       ▼                                         │
+        │  result = _run_core(spec, hook, messages)       │
+        │       │                                         │
+        │       ├── 正常 ──► hook.after_run() ──► return  │
+        │       └── 异常 ──► hook.on_error() ──► return   │
+        │                                                │
+        │  finally:                                       │
+        │    hook.after_run() （未调用时）                 │
+        │                                                │
+        └────────────────────────────────────────────────┘
         """
-        result = AgentRunResult()
         run_hctx = AgentRunHookContext(messages=messages)
         await self.hook.before_run(run_hctx)
+
         if not self.on_progress:
             async def noop(*a, **kw): pass
             self.on_progress = noop
 
-        iteration = 0
-        while iteration < self.max_iterations:
+        result = await self._run_core(messages, tools, model)
+        run_hctx.final_content = result.final_content
+        run_hctx.tools_used = result.tools_used
+        run_hctx.stop_reason = result.stop_reason
+        if result.stop_reason == "error":
+            run_hctx.error = result.final_content
+            await self.hook.on_error(run_hctx)
+        else:
+            await self.hook.after_run(run_hctx)
+        return result
+
+    async def _run_core(
+        self,
+        messages: list[dict[str, Any]],
+        tools: ToolRegistry,
+        model: str | None = None,
+    ) -> AgentRunResult:
+        """ReAct 核心循环：LLM 调用 ↔ 工具执行，直到完成或达到最大迭代次数。
+
+        ┌──────────────────────────────────────────────────────┐
+        │  _run_core()                                         │
+        ├──────────────────────────────────────────────────────┤
+        │                                                      │
+        │  for iteration in range(max_iterations):             │
+        │    hook.before_iteration()                           │
+        │       │                                              │
+        │       ▼                                              │
+        │    LLM call（首轮流式 chat_stream / 后续 chat）      │
+        │       │                                              │
+        │       ├── finish_reason="error" ──► 返回 error       │
+        │       │                                              │
+        │       ├── 有 tool_calls:                              │
+        │       │    hook.before_execute_tools()                │
+        │       │    执行工具 → 追加 tool_result               │
+        │       │    hook.after_iteration()                     │
+        │       │    continue                                   │
+        │       │                                              │
+        │       └── 无 tool_calls:                              │
+        │            hook.after_iteration()                     │
+        │            返回最终回复                                │
+        │                                                      │
+        │  max_iterations 耗尽 → 返回 fallback                  │
+        │                                                      │
+        └──────────────────────────────────────────────────────┘
+        """
+        result = AgentRunResult()
+        for iteration in range(self.max_iterations):
             logger.info("ReAct 迭代 %d/%d, messages=%d, stream=%s",
                         iteration + 1, self.max_iterations, len(messages),
                         self.on_stream is not None and iteration == 0)
-            
+
             # ── hook: before_iteration ──
             hctx = AgentHookContext(iteration=iteration, messages=messages,
-                                    session_key=getattr(self, '_session_key', None))
+                                    session_key=self._session_key)
             await self.hook.before_iteration(hctx)
 
-            # ── 首次调用且要求流式：走 chat_stream() ──
+            # ── 打印本轮消息上下文 ──
+            for i, m in enumerate(messages):
+                role = m.get("role", "?")
+                content_preview = str(m.get("content", ""))
+                tc = m.get("tool_calls")
+                tc_hint = f", tool_calls={len(tc)}" if tc else ""
+                logger.info("  messages[%d] role=%s content=%s%s", i, role, content_preview, tc_hint)
+
+            # ── LLM 调用 ──
             if iteration == 0 and self.on_stream is not None:
-                response = await self._chat_stream_with_tools(
-                    messages, tools, model,
-                )
+                logger.info(f"_chat_stream_with_tools messages ={messages}")
+                response = await self._chat_stream_with_tools(messages, tools, model)
             else:
-                # 非首轮或非流式模式：走普通 chat()
+                logger.info(f"await self.provider.chat messages ={messages}")
                 response = await self.provider.chat(
-                    messages=messages,
-                    model=model,
+                    messages=messages, model=model,
                     tools=tools.get_definitions() if tools.tool_names else None,
                 )
 
@@ -112,92 +195,63 @@ class AgentRunner:
                 err = response.usage.get("error", "unknown")
                 result.final_content = f"[LLM 调用失败: {err}]"
                 result.stop_reason = "error"
-                run_hctx.error = result.final_content
-                await self.hook.on_error(run_hctx)
                 return result
 
-            # ── 构建 assistant 消息 ──
-            assistant_msg: dict[str, Any] = {"role": "assistant"}
-            if response.content:
-                assistant_msg["content"] = response.content
-            else:
-                assistant_msg["content"] = None
-
-            # ── 处理工具调用 ──
+            # ── 工具调用分支 ──
             if response.tool_calls:
+                logger.info("response.tool_calls")
                 result.had_tool_calls = True
                 tool_calls_openai = []
                 for tc in response.tool_calls:
                     result.tools_used.append(tc.name)
                     tool_calls_openai.append({
-                        "id": tc.id,
-                        "type": "function",
+                        "id": tc.id, "type": "function",
                         "function": {
                             "name": tc.name,
                             "arguments": tc.arguments if isinstance(tc.arguments, str)
                             else json.dumps(tc.arguments),
                         },
                     })
-                assistant_msg["tool_calls"] = tool_calls_openai
-                messages.append(assistant_msg)
+                messages.append(build_assistant_message(
+                    response.content, tool_calls=tool_calls_openai,
+                ))
 
-                # ── hook: before_execute_tools ──
                 hctx.tool_calls = response.tool_calls
                 hctx.response = response
                 await self.hook.before_execute_tools(hctx)
-                
-                # 执行每个工具
+
                 await self.on_progress(f"执行工具: {result.tools_used[-1]}")
                 for tc in response.tool_calls:
                     exc_result = await tools.execute(tc.name, tc.arguments)
                     messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
+                        "role": "tool", "tool_call_id": tc.id,
                         "content": exc_result,
                     })
                     logger.info("工具 %s 返回 %d 字符", tc.name, len(exc_result))
 
-                iteration += 1
-                # ── hook: after_iteration ──
                 hctx.tool_results = [m.get("content", "") for m in messages if m.get("role") == "tool"]
                 hctx.usage = response.usage or {}
                 await self.hook.after_iteration(hctx)
-
-                continue  # 继续下一轮 ReAct 迭代（后续轮次不流式）
+                continue
 
             # ── 无工具调用：最终回复 ──
-            messages.append(assistant_msg)
+            messages.append(build_assistant_message(response.content))
             result.final_content = response.content or ""
             result.stop_reason = response.finish_reason
             result.all_messages = messages
 
-            # ── hook: after_iteration ──
             hctx.tool_results = []
             hctx.usage = response.usage or {}
             hctx.response = response
             hctx.final_content = result.final_content
             hctx.stop_reason = result.stop_reason
             await self.hook.after_iteration(hctx)
-
-            # ── hook: after_run ──
-            run_hctx.final_content = result.final_content
-            run_hctx.tools_used = result.tools_used
-            run_hctx.stop_reason = result.stop_reason
-            await self.hook.after_run(run_hctx)
-
-            # 首轮流式结束时通知渲染器
-
             return result
 
         # 超过最大迭代次数
         logger.warning("ReAct 循环达到最大迭代次数 %d", self.max_iterations)
         result.final_content = messages[-1].get("content", "") or "[达到最大工具调用次数]"
         result.stop_reason = "max_iterations"
-#             await self.on_stream_end(resuming=False)
-        run_hctx.final_content = result.final_content
-        run_hctx.tools_used = result.tools_used
-        run_hctx.stop_reason = result.stop_reason
-        await self.hook.after_run(run_hctx)
         return result
 
     async def _chat_stream_with_tools(

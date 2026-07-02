@@ -163,7 +163,7 @@ class OpenAICompatProvider(LLMProvider):
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         url = f"{self.api_base.rstrip('/')}/chat/completions"
-
+        logger.info(f"body{body}")
         try:
             timeout = httpx.Timeout(connect=120.0, read=300.0, write=120.0, pool=30.0)
             async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False) as client:
@@ -176,7 +176,7 @@ class OpenAICompatProvider(LLMProvider):
                     pending_tool_calls: dict[int, dict[str, Any]] = {}
 
                     async for line in resp.aiter_lines():
-                        logger.info(f"line{line}")
+                        # logger.info(f"line{line}")
                         if not line or not line.startswith("data: "):
                             continue
 
