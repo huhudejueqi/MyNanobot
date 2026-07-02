@@ -300,6 +300,28 @@ class AgentRunner:
         return True
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        """Agent 运行入口：hook 包装层，委托 _run_core 执行 ReAct 循环。
+
+        ┌──────────────────────────────────────────────────────────────┐
+        │  run() 流程                                                  │
+        ├──────────────────────────────────────────────────────────────┤
+        │                                                              │
+        │  hook.before_run(context)                                    │
+        │       │                                                      │
+        │       ▼                                                      │
+        │  result = await _run_core(spec, hook, messages)              │
+        │       │                                                      │
+        │       ├── 正常返回 ──► hook.after_run(context) ──► return    │
+        │       ├── CancelledError ──► raise                           │
+        │       └── 其他异常 ──► hook.on_error(context) ──► raise      │
+        │                                                              │
+        │  finally:                                                     │
+        │    hook.on_finally(context)                                   │
+        │                                                              │
+        └──────────────────────────────────────────────────────────────┘
+
+        详细 ReAct 循环见 _run_core() 的文档注释。
+        """
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         context = AgentRunHookContext(messages=deepcopy(messages))
@@ -353,32 +375,63 @@ class AgentRunner:
         hook: AgentHook,
         messages: list[dict[str, Any]],
     ) -> AgentRunResult:
-        final_content: str | None = None
-        tools_used: list[str] = []
-        usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
-        error: str | None = None
-        stop_reason = "completed"
-        tool_events: list[dict[str, str]] = []
-        external_lookup_counts: dict[str, int] = {}
-        # Per-turn throttle for repeated attempts against the same outside target.
-        workspace_violation_counts: dict[str, int] = {}
-        empty_content_retries = 0
-        length_recovery_count = 0
-        had_injections = False
-        injection_cycles = 0
+        """Agent 核心运行循环 -- 处理一次完整的 LLM 多轮对话。
 
+        ┌─────────────────────────────────────────────────────────┐
+        │                    _run_core 流程总览                    │
+        ├─────────────────────────────────────────────────────────┤
+        │                                                       │
+        │  ┌──────────────────────────────────────────────┐      │
+        │  │  for iteration in range(max_iterations)      │      │
+        │  │                                              │      │
+        │  │  1. 上下文治理（清理/修复/压缩历史消息）      │      │
+        │  │  2. 调用 LLM 获取响应                         │      │
+        │  │  3. 提取推理内容（reasoning）                 │      │
+        │  │  4. 判断模型响应类型：                        │      │
+        │  │     ├── 需要执行工具 -> 执行工具 -> continue   │      │
+        │  │     ├── 空内容 -> 重试 or 终结               │      │
+        │  │     ├── 截断(length) -> 续写 -> continue      │      │
+        │  │     ├── 注入消息 -> 排干注入 -> continue       │      │
+        │  │     ├── 错误 -> 错误处理 -> break             │      │
+        │  │     └── 正常完成 -> break                     │      │
+        │  │                                              │      │
+        │  │  5. 每次迭代结束调用 hook.after_iteration()   │      │
+        │  │                                              │      │
+        │  └──────────────────────────────────────────────┘      │
+        │                                                       │
+        │  for-else: max_iterations 耗尽                        │
+        │    └── 排干剩余注入 -> 尝试终结 -> 返回 fallback        │
+        │                                                       │
+        └─────────────────────────────────────────────────────────┘
+        """
+        # --- 运行状态变量 ---
+        final_content: str | None = None          # 最终文本回复
+        tools_used: list[str] = []                # 本轮用到的工具名称列表
+        usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}  # token 用量累计
+        error: str | None = None                  # 运行错误信息
+        stop_reason = "completed"                 # 结束原因（completed/error/tool_error/max_iterations/empty_final_response）
+        tool_events: list[dict[str, str]] = []    # 工具调用事件日志
+        external_lookup_counts: dict[str, int] = {}       # 外部查找限流计数
+        workspace_violation_counts: dict[str, int] = {}   # 工作区违规限流计数
+        empty_content_retries = 0                 # 空内容重试次数
+        length_recovery_count = 0                 # 输出截断恢复次数
+        had_injections = False                    # 本轮是否产生了注入消息
+        injection_cycles = 0                      # 注入排干循环计数器
+
+        # ================================================================
+        # 主循环：每轮迭代完成一次"调用 LLM -> 执行工具 -> 处理响应"的回合
+        # ================================================================
         for iteration in range(spec.max_iterations):
+            # --- 上下文治理：清理/修复/压缩历史消息，确保发送给模型的消息格式正确 ---
             try:
-                # Keep the persisted conversation untouched. Context governance
-                # may repair or compact historical messages for the model, but
-                # those synthetic edits must not shift the append boundary used
-                # later when the caller saves only the new turn.
-                messages_for_model = self._drop_orphan_tool_results(messages)
-                messages_for_model = self._backfill_missing_tool_results(messages_for_model)
-                messages_for_model = self._microcompact(messages_for_model)
-                messages_for_model = self._apply_tool_result_budget(spec, messages_for_model)
-                messages_for_model = self._snip_history(spec, messages_for_model)
-                # Snipping may have created new orphans; clean them up.
+                # 注意：治理在 messages_for_model 副本上操作，绝不修改原始的 messages，
+                # 以保证调用方后续只追加本轮新消息的语义不变。
+                messages_for_model = self._drop_orphan_tool_results(messages)           # 丢弃孤立 tool_result
+                messages_for_model = self._backfill_missing_tool_results(messages_for_model)  # 回填缺失 tool_result
+                messages_for_model = self._microcompact(messages_for_model)               # 微型压缩（合并连续短消息）
+                messages_for_model = self._apply_tool_result_budget(spec, messages_for_model)  # 按 budget 截断 tool_result
+                messages_for_model = self._snip_history(spec, messages_for_model)         # 按 token 预算裁剪历史
+                # 裁剪可能产生新的孤立 tool_result，再次清理
                 messages_for_model = self._drop_orphan_tool_results(messages_for_model)
                 messages_for_model = self._backfill_missing_tool_results(messages_for_model)
             except Exception:
@@ -388,39 +441,53 @@ class AgentRunner:
                     spec.session_key or "default",
                 )
                 try:
+                    # 治理失败时的最小修复：仅清理孤立和回填
                     messages_for_model = self._drop_orphan_tool_results(messages)
                     messages_for_model = self._backfill_missing_tool_results(messages_for_model)
                 except Exception:
+                    # 极端情况：直接使用原始消息
                     messages_for_model = messages
+            # --- 创建本轮上下文，触发 before_iteration hook ---
             context = AgentHookContext(
                 iteration=iteration,
                 messages=messages,
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
+
+            # --- 调用 LLM 获取响应 ---
             response = await self._request_model(spec, messages_for_model, hook, context)
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
+            # --- 提取推理内容（reasoning/thinking），从 content 中剥离 ---
             reasoning_text, cleaned_content = extract_reasoning(
                 response.reasoning_content,
                 response.thinking_blocks,
                 response.content,
             )
             response.content = cleaned_content
+
+            # --- 累计 token 用量 ---
             raw_usage = self._usage_or_estimate(spec, messages_for_model, response)
             context.usage = dict(raw_usage)
             self._accumulate_usage(usage, raw_usage)
+
+            # --- 流式输出推理内容（仅首次） ---
             if reasoning_text and not context.streamed_reasoning:
                 await hook.emit_reasoning(reasoning_text)
                 await hook.emit_reasoning_end()
                 context.streamed_reasoning = True
 
+            # ================================================================
+            # 分支 1：模型请求执行工具
+            # ================================================================
             if response.should_execute_tools:
                 context.tool_calls = list(response.tool_calls)
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
 
+                # --- 构造 assistant 消息，包含文本回复和 tool_call 请求 ---
                 assistant_message = build_assistant_message(
                     response.content or "",
                     tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
@@ -431,7 +498,7 @@ class AgentRunner:
                 await self._emit_checkpoint(
                     spec,
                     {
-                        "phase": "awaiting_tools",
+                        "phase": "awaiting_tools",                      # 等待工具执行阶段
                         "iteration": iteration,
                         "model": spec.model,
                         "assistant_message": assistant_message,
@@ -442,6 +509,7 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
+                # --- 执行工具调用 ---
                 results, new_events, fatal_error = await self._execute_tools(
                     spec,
                     response.tool_calls,
@@ -449,6 +517,7 @@ class AgentRunner:
                     workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
+                # 记录成功执行的工具名称
                 tools_used.extend(
                     tool_call.name
                     for tool_call, event in zip(response.tool_calls, new_events)
@@ -456,6 +525,8 @@ class AgentRunner:
                 )
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
+
+                # --- 将工具结果以 tool role 消息追加到对话历史 ---
                 completed_tool_results: list[dict[str, Any]] = []
                 for tool_call, result in zip(response.tool_calls, results):
                     tool_message = {
@@ -471,6 +542,8 @@ class AgentRunner:
                     }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
+
+                # --- 处理工具执行致命错误 ---
                 if fatal_error is not None:
                     error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
                     final_content = error
@@ -480,6 +553,7 @@ class AgentRunner:
                     context.error = error
                     context.stop_reason = stop_reason
                     await hook.after_iteration(context)
+                    # 工具错误后尝试排干注入
                     should_continue, injection_cycles = await self._try_drain_injections(
                         spec, messages, None, injection_cycles,
                         phase="after tool error",
@@ -488,10 +562,11 @@ class AgentRunner:
                         had_injections = True
                         continue
                     break
+
                 await self._emit_checkpoint(
                     spec,
                     {
-                        "phase": "tools_completed",
+                        "phase": "tools_completed",                     # 工具执行完成阶段
                         "iteration": iteration,
                         "model": spec.model,
                         "assistant_message": assistant_message,
@@ -499,9 +574,10 @@ class AgentRunner:
                         "pending_tool_calls": [],
                     },
                 )
+
+                # --- 工具执行成功后，重置重试计数器，排干注入，进入下一轮迭代 ---
                 empty_content_retries = 0
                 length_recovery_count = 0
-                # Checkpoint 1: drain injections after tools, before next LLM call
                 _drained, injection_cycles = await self._try_drain_injections(
                     spec, messages, None, injection_cycles,
                     phase="after tool execution",
@@ -511,6 +587,9 @@ class AgentRunner:
                 await hook.after_iteration(context)
                 continue
 
+            # ================================================================
+            # 分支 2：模型表达了工具调用意愿但不应执行（finish_reason 不匹配）
+            # ================================================================
             if response.has_tool_calls:
                 logger.warning(
                     "Ignoring tool calls under finish_reason='{}' for {}",
@@ -518,10 +597,14 @@ class AgentRunner:
                     spec.session_key or "default",
                 )
 
+            # ================================================================
+            # 分支 3：空内容处理 —— 模型返回空文本时的重试逻辑
+            # ================================================================
             clean = hook.finalize_content(context, response.content)
             if response.finish_reason != "error" and is_blank_text(clean):
                 empty_content_retries += 1
                 if empty_content_retries < _MAX_EMPTY_RETRIES:
+                    # 1) 软重试：简单重试（通常模型下次会正常返回）
                     logger.warning(
                         "Empty response on turn {} for {} ({}/{}); retrying",
                         iteration,
@@ -533,6 +616,7 @@ class AgentRunner:
                         await hook.on_stream_end(context, resuming=False)
                     await hook.after_iteration(context)
                     continue
+                # 2) 硬重试：重试次数耗尽，使用终结提示尝试 finalization
                 logger.warning(
                     "Empty response on turn {} for {} after {} retries; attempting finalization",
                     iteration,
@@ -551,6 +635,9 @@ class AgentRunner:
                 context.tool_calls = list(response.tool_calls)
                 clean = hook.finalize_content(context, response.content)
 
+            # ================================================================
+            # 分支 4：输出截断处理 —— finish_reason=length，需要续写
+            # ================================================================
             if response.finish_reason == "length" and not is_blank_text(clean):
                 length_recovery_count += 1
                 if length_recovery_count <= _MAX_LENGTH_RECOVERIES:
@@ -563,6 +650,7 @@ class AgentRunner:
                     )
                     if hook.wants_streaming():
                         await hook.on_stream_end(context, resuming=True)
+                    # 将已有内容追加到对话，并插入续写提示
                     messages.append(build_assistant_message(
                         clean,
                         reasoning_content=response.reasoning_content,
@@ -572,6 +660,9 @@ class AgentRunner:
                     await hook.after_iteration(context)
                     continue
 
+            # ================================================================
+            # 分支 5：正常文本回复 —— 先排干注入，再决定是否结束本轮
+            # ================================================================
             assistant_message: dict[str, Any] | None = None
             if response.finish_reason != "error" and not is_blank_text(clean):
                 assistant_message = build_assistant_message(
@@ -580,9 +671,8 @@ class AgentRunner:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-            # Check for mid-turn injections BEFORE signaling stream end.
-            # If injections are found we keep the stream alive (resuming=True)
-            # so streaming channels don't prematurely finalize the card.
+            # --- 在结束流式信号之前检查注入消息 ---
+            # 如果发现注入，保持流存活（resuming=True），避免流式通道过早终止卡片。
             should_continue, injection_cycles = await self._try_drain_injections(
                 spec, messages, assistant_message, injection_cycles,
                 phase="after final response",
@@ -595,11 +685,16 @@ class AgentRunner:
             if hook.wants_streaming():
                 await hook.on_stream_end(context, resuming=should_continue)
 
+            # 有注入消息需要处理，继续下一轮迭代
             if should_continue:
                 await hook.after_iteration(context)
                 continue
 
+            # ================================================================
+            # 分支 6：LLM 返回错误
+            # ================================================================
             if response.finish_reason == "error":
+                # --- 区分欠费错误与普通 LLM 错误 ---
                 if LLMProvider.is_arrearage_response(response):
                     final_content = _ARREARAGE_ERROR_MESSAGE
                 else:
@@ -619,6 +714,10 @@ class AgentRunner:
                     had_injections = True
                     continue
                 break
+
+            # ================================================================
+            # 分支 7：重试后仍为空内容 —— 标记为空最终响应
+            # ================================================================
             if is_blank_text(clean):
                 final_content = EMPTY_FINAL_RESPONSE_MESSAGE
                 stop_reason = "empty_final_response"
@@ -637,6 +736,9 @@ class AgentRunner:
                     continue
                 break
 
+            # ================================================================
+            # 正常完成 —— 追加最终消息、发射检查点、退出主循环
+            # ================================================================
             messages.append(assistant_message or build_assistant_message(
                 clean,
                 reasoning_content=response.reasoning_content,
@@ -645,7 +747,7 @@ class AgentRunner:
             await self._emit_checkpoint(
                 spec,
                 {
-                    "phase": "final_response",
+                    "phase": "final_response",          # 最终响应阶段
                     "iteration": iteration,
                     "model": spec.model,
                     "assistant_message": messages[-1],
@@ -659,12 +761,12 @@ class AgentRunner:
             await hook.after_iteration(context)
             break
         else:
+            # ================================================================
+            # max_iterations 耗尽 —— 循环自然结束（未 break）
+            # ================================================================
             stop_reason = "max_iterations"
-            # Drain any remaining injections so they are appended to the
-            # conversation history instead of being re-published as
-            # independent inbound messages by _dispatch's finally block.
-            # We include them before the no-tools finalization pass so the
-            # final response can account for every known follow-up.
+            # 排干剩余注入，避免它们在 _dispatch 的 finally 块中被重新发布为独立入站消息。
+            # 在无工具的终结传递前排干，以便最终回复能涵盖所有已知后续操作。
             drained_after_max_iterations, injection_cycles = await self._try_drain_injections(
                 spec, messages, None, injection_cycles,
                 phase="after max_iterations",
@@ -672,6 +774,7 @@ class AgentRunner:
             if drained_after_max_iterations:
                 had_injections = True
             final_content = None
+            # 尝试让 LLM 给出终结回复（如果配置允许）
             if spec.finalize_on_max_iterations:
                 final_content = await self._try_finalize_after_max_iterations(
                     spec,
@@ -683,15 +786,16 @@ class AgentRunner:
                 final_content = self._max_iterations_fallback(spec)
             self._append_final_message(messages, final_content)
 
+        # --- 返回本轮运行结果，供 _run() 调用方消费 ---
         return AgentRunResult(
-            final_content=final_content,
-            messages=messages,
-            tools_used=tools_used,
-            usage=usage,
-            stop_reason=stop_reason,
-            error=error,
-            tool_events=tool_events,
-            had_injections=had_injections,
+            final_content=final_content,    # 最终回复文本
+            messages=messages,              # 更新后的完整对话历史
+            tools_used=tools_used,          # 成功工具列表
+            usage=usage,                    # token 用量汇总
+            stop_reason=stop_reason,        # 结束原因
+            error=error,                    # 错误信息（如有）
+            tool_events=tool_events,        # 工具事件日志
+            had_injections=had_injections,  # 是否产生注入
         )
 
     def _build_request_kwargs(
@@ -1568,3 +1672,45 @@ class AgentRunner:
         if current:
             batches.append(current)
         return batches
+        """Agent 核心运行循环 -- 处理一次完整的 LLM 多轮对话。
+
+        ┌─────────────────────────────────────────────────────────┐
+        │                    _run_core 流程总览                    │
+        ├─────────────────────────────────────────────────────────┤
+        │                                                       │
+        │  ┌──────────────────────────────────────────────┐      │
+        │  │  for iteration in range(max_iterations)      │      │
+        │  │                                              │      │
+        │  │  1. 上下文治理（清理/修复/压缩历史消息）      │      │
+        │  │  2. 调用 LLM 获取响应                         │      │
+        │  │  3. 提取推理内容（reasoning）                 │      │
+        │  │  4. 判断模型响应类型：                        │      │
+        │  │     ├── 需要执行工具 -> 执行工具 -> continue   │      │
+        │  │     ├── 空内容 -> 重试 or 终结               │      │
+        │  │     ├── 截断(length) -> 续写 -> continue      │      │
+        │  │     ├── 注入消息 -> 排干注入 -> continue       │      │
+        │  │     ├── 错误 -> 错误处理 -> break             │      │
+        │  │     └── 正常完成 -> break                     │      │
+        │  │                                              │      │
+        │  │  5. 每次迭代结束调用 hook.after_iteration()   │      │
+        │  │                                              │      │
+        │  └──────────────────────────────────────────────┘      │
+        │                                                       │
+        │  for-else: max_iterations 耗尽                        │
+        │    └── 排干剩余注入 -> 尝试终结 -> 返回 fallback        │
+        │                                                       │
+        └───────────────────────────────────────────────---───────┘
+        """
+        final_content: str | None = None
+        tools_used: list[str] = []
+        usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+        error: str | None = None
+        stop_reason = "completed"
+        tool_events: list[dict[str, str]] = []
+        external_lookup_counts: dict[str, int] = {}
+        # 每轮对话对外部同目标的重复尝试限流
+        workspace_violation_counts: dict[str, int] = {}
+        empty_content_retries = 0
+        length_recovery_count = 0
+        had_injections = False
+        injection_cycles = 0
