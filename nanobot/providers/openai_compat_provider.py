@@ -176,6 +176,7 @@ class OpenAICompatProvider(LLMProvider):
                     pending_tool_calls: dict[int, dict[str, Any]] = {}
 
                     async for line in resp.aiter_lines():
+                        logger.info(f"line{line}")
                         if not line or not line.startswith("data: "):
                             continue
 

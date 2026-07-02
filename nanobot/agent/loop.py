@@ -16,8 +16,12 @@ from typing import Any, Awaitable, Callable, Coroutine
 import base64
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.command.router import CommandRouter, CommandContext
+from nanobot.command.builtin import register_builtin_commands
 from nanobot.agent.runner import AgentRunner
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.mcp import connect_mcp_servers
 from nanobot.agent.tools.shell import ShellTool
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
 from nanobot.utils.document import extract_documents, is_image_file
@@ -67,6 +71,45 @@ class TurnContext:
     turn_wall_started_at: float = field(default_factory=time.time)
     trace: list[StateTraceEntry] = field(default_factory=list)
     error: str | None = None
+
+
+class _DebugHook(AgentHook):
+    """调试钩子：把 hook 事件全部打印到 logger.info。"""
+
+    async def before_run(self, ctx: AgentRunHookContext) -> None:
+        logger.info("[_DebugHook] before_run: messages=%d", len(ctx.messages))
+
+    async def after_run(self, ctx: AgentRunHookContext) -> None:
+        logger.info("[_DebugHook] after_run: final_content=%.200r, tools_used=%s, stop_reason=%s",
+                     ctx.final_content, ctx.tools_used, ctx.stop_reason)
+
+    async def on_error(self, ctx: AgentRunHookContext) -> None:
+        logger.info("[_DebugHook] on_error: %s", ctx.error)
+
+    async def before_iteration(self, ctx: AgentHookContext) -> None:
+        tool_hint = ""
+        if ctx.tool_calls:
+            names = [f"{tc.name}(...)" for tc in ctx.tool_calls]
+            tool_hint = f", tool_calls={names}"
+        logger.info("[_DebugHook] before_iteration #%d: messages=%d%s",
+                     ctx.iteration, len(ctx.messages), tool_hint)
+
+    async def after_iteration(self, ctx: AgentHookContext) -> None:
+        if ctx.response and ctx.response.content:
+            logger.info("[_DebugHook] after_iteration #%d: LLM 回复=%.200r",
+                         ctx.iteration, ctx.response.content)
+        if ctx.tool_results:
+            for i, r in enumerate(ctx.tool_results):
+                logger.info("[_DebugHook] after_iteration #%d: 工具%d 结果=%.200r",
+                             ctx.iteration, i, r)
+
+    async def before_execute_tools(self, ctx: AgentHookContext) -> None:
+        for tc in ctx.tool_calls:
+            logger.info("[_DebugHook] before_execute_tools: %s(args=%s)",
+                         tc.name, tc.arguments)
+
+    async def on_stream(self, ctx: AgentHookContext, delta: str) -> None:
+        logger.info("[_DebugHook] on_stream: delta=%.200r", delta)
 
 
 class AgentLoop:
@@ -178,6 +221,7 @@ class AgentLoop:
         max_iterations: int = 10,
         on_llm_start: Callable[[], Coroutine] | None = None,
         on_llm_end: Callable[[], Coroutine] | None = None,
+        mcp_servers: dict[str, Any] | None = None,
     ):
         self.bus = bus
         self.provider = provider
@@ -194,6 +238,10 @@ class AgentLoop:
         self._handlers: list[Callable[[InboundMessage], str | None]] = []
         self._session_store: dict[str, list[dict[str, Any]]] = {}
         self.context = ContextBuilder(workspace)
+        self.commands = CommandRouter()
+        register_builtin_commands(self.commands)
+        self._mcp_servers = dict(mcp_servers or {})
+        self._mcp_stacks: dict[str, Any] = {}
         self._pending_queues: dict[str, asyncio.Queue] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
 
@@ -202,9 +250,12 @@ class AgentLoop:
         self.runner = AgentRunner(
             provider=self.provider, max_iterations=max_iterations or 10,
             on_progress=self._on_tool_progress,
+            hook=_DebugHook(),
         )
         self.max_iterations = max_iterations or 10
         self._register_default_tools()
+        self._mcp_connected = False
+        self._mcp_connecting = False
 
         logger.info("初始化: model=%s, provider=%s", model, type(provider).__name__)
 
@@ -248,10 +299,13 @@ class AgentLoop:
         if bus is None:
             bus = MessageBus()
         workspace = Path.home() / ".nanobot" / "workspace"
+        tools_cfg = config.raw.get("tools", {})
+        mcp_servers = tools_cfg.get("mcpServers") or tools_cfg.get("mcp_servers") or {}
         return cls(
             bus=bus, provider=snapshot.provider,
             workspace=workspace, model=snapshot.model,
             context_window_tokens=snapshot.context_window_tokens,
+            mcp_servers=mcp_servers,
         )
 
     # ── 状态机驱动（异步处理，不阻塞主循环） ──
@@ -281,6 +335,32 @@ class AgentLoop:
             event, error = "ok", None
             try:
                 event = await handler(ctx)
+                # 打印当前状态的上下文快照
+                sname = ctx.state.name
+                if sname == "RESTORE":
+                    logger.info("[%s] RESTORE: session_key=%s, session=%s, media=%d, history=%d",
+                                ctx.turn_wall_started_at, ctx.session_key,
+                                ctx.session is not None, len(ctx.msg.media or []), len(ctx.history))
+                elif sname == "COMPACT":
+                    logger.info("[%s] COMPACT: history_len=%d", ctx.turn_wall_started_at, len(ctx.history))
+                elif sname == "COMMAND":
+                    logger.info("[%s] COMMAND: event=%s", ctx.turn_wall_started_at, event)
+                elif sname == "BUILD":
+                    logger.info("[%s] BUILD: history=%d, all_messages=%d", ctx.turn_wall_started_at,
+                                len(ctx.history), len(ctx.all_messages))
+                elif sname == "RUN":
+                    logger.info("[%s] RUN: final_content=%.200r, tools_used=%s, stop_reason=%s",
+                                ctx.turn_wall_started_at, ctx.final_content or "",
+                                ctx.tools_used, ctx.stop_reason)
+                elif sname == "SAVE":
+                    logger.info("[%s] SAVE: session_len=%d, content=%.100r",
+                                ctx.turn_wall_started_at,
+                                len(ctx.session.get("messages", [])) if ctx.session else 0,
+                                ctx.final_content or "")
+                elif sname == "RESPOND":
+                    logger.info("[%s] RESPOND: outbound.content=%.100r",
+                                ctx.turn_wall_started_at,
+                                ctx.outbound.content if ctx.outbound else None)
             except Exception as e:
                 event, error = "error", str(e)
                 logger.error("%s 异常: %s", ctx.state.name, error)
@@ -393,22 +473,13 @@ class AgentLoop:
         return "ok"
 
     async def _state_command(self, ctx: TurnContext) -> str:
-        content = ctx.msg.content.strip()
-        for handler in self._handlers:
-            result = handler(ctx.msg)
-            if asyncio.iscoroutine(result):
-                result = await result
-            if result is not None:
-                ctx.final_content = result
-                return "shortcut"
-        if content in ("/ping", "/status"):
-            ctx.final_content = "pong"
-            return "shortcut"
-        if content == "/time":
-            ctx.final_content = f"当前时间: {datetime.now()}"
-            return "shortcut"
-        if content == "/version":
-            ctx.final_content = "MyNanobot v0.1.0"
+        cmd_ctx = CommandContext(
+            msg=ctx.msg, session=ctx.session, key=ctx.session_key,
+            raw=ctx.msg.content.strip(), loop=self,
+        )
+        result = await self.commands.dispatch(cmd_ctx)
+        if result is not None:
+            ctx.outbound = result
             return "shortcut"
         return "dispatch"
 
@@ -454,9 +525,10 @@ class AgentLoop:
         try:
             t0 = time.time()
 
-            # 刷新 runner 的流式回调
+            # 刷新 runner 的流式回调和 session_key
             self.runner.on_stream = ctx.on_stream
             self.runner.on_stream_end = ctx.on_stream_end
+            self.runner._session_key = ctx.session_key
 
             # 使用 AgentRunner 执行 ReAct 循环
             result = await self.runner.run(
@@ -524,6 +596,12 @@ class AgentLoop:
         不阻塞主循环，可以同时处理多条消息。
         符合原版模式：run 是 1s 监听，dispatch 异步处理。
         """
+        if self._mcp_servers and not self._mcp_connected:
+            logger.info("连接 MCP 服务器: %s", list(self._mcp_servers))
+            connected = await connect_mcp_servers(self._mcp_servers, self.tools)
+            self._mcp_stacks.update(connected)
+            self._mcp_connected = bool(self._mcp_stacks)
+
         logger.info("主循环启动 (1s 轮询)")
         self._running = True
         loop = asyncio.get_running_loop()
@@ -564,6 +642,12 @@ class AgentLoop:
     async def stop(self) -> None:
         """停止主循环。"""
         self._running = False
+        # 关闭 MCP 连接
+        for name, stack in list(self._mcp_stacks.items()):
+            try:
+                await stack.aclose()
+            except Exception:
+                logger.debug("MCP server '%s' 关闭异常", name)
         if self._task is not None:
             self._task.cancel()
             try:

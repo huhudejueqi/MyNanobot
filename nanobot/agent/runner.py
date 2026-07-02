@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext, CompositeHook
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, StreamDelta
 
@@ -54,12 +55,15 @@ class AgentRunner:
         on_progress=None,
         on_stream=None,
         on_stream_end=None,
+        hook: AgentHook | None = None,
     ):
         self.provider = provider
         self.max_iterations = max_iterations
         self.on_progress = on_progress
         self.on_stream = on_stream
         self.on_stream_end = on_stream_end
+        self.hook = hook or AgentHook()
+        self._session_key: str | None = None
 
     async def run(
         self,
@@ -73,6 +77,8 @@ class AgentRunner:
         工具后续轮次走非流式 chat()。
         """
         result = AgentRunResult()
+        run_hctx = AgentRunHookContext(messages=messages)
+        await self.hook.before_run(run_hctx)
         if not self.on_progress:
             async def noop(*a, **kw): pass
             self.on_progress = noop
@@ -82,6 +88,11 @@ class AgentRunner:
             logger.info("ReAct 迭代 %d/%d, messages=%d, stream=%s",
                         iteration + 1, self.max_iterations, len(messages),
                         self.on_stream is not None and iteration == 0)
+            
+            # ── hook: before_iteration ──
+            hctx = AgentHookContext(iteration=iteration, messages=messages,
+                                    session_key=getattr(self, '_session_key', None))
+            await self.hook.before_iteration(hctx)
 
             # ── 首次调用且要求流式：走 chat_stream() ──
             if iteration == 0 and self.on_stream is not None:
@@ -101,6 +112,8 @@ class AgentRunner:
                 err = response.usage.get("error", "unknown")
                 result.final_content = f"[LLM 调用失败: {err}]"
                 result.stop_reason = "error"
+                run_hctx.error = result.final_content
+                await self.hook.on_error(run_hctx)
                 return result
 
             # ── 构建 assistant 消息 ──
@@ -128,6 +141,11 @@ class AgentRunner:
                 assistant_msg["tool_calls"] = tool_calls_openai
                 messages.append(assistant_msg)
 
+                # ── hook: before_execute_tools ──
+                hctx.tool_calls = response.tool_calls
+                hctx.response = response
+                await self.hook.before_execute_tools(hctx)
+                
                 # 执行每个工具
                 await self.on_progress(f"执行工具: {result.tools_used[-1]}")
                 for tc in response.tool_calls:
@@ -140,6 +158,11 @@ class AgentRunner:
                     logger.info("工具 %s 返回 %d 字符", tc.name, len(exc_result))
 
                 iteration += 1
+                # ── hook: after_iteration ──
+                hctx.tool_results = [m.get("content", "") for m in messages if m.get("role") == "tool"]
+                hctx.usage = response.usage or {}
+                await self.hook.after_iteration(hctx)
+
                 continue  # 继续下一轮 ReAct 迭代（后续轮次不流式）
 
             # ── 无工具调用：最终回复 ──
@@ -147,6 +170,20 @@ class AgentRunner:
             result.final_content = response.content or ""
             result.stop_reason = response.finish_reason
             result.all_messages = messages
+
+            # ── hook: after_iteration ──
+            hctx.tool_results = []
+            hctx.usage = response.usage or {}
+            hctx.response = response
+            hctx.final_content = result.final_content
+            hctx.stop_reason = result.stop_reason
+            await self.hook.after_iteration(hctx)
+
+            # ── hook: after_run ──
+            run_hctx.final_content = result.final_content
+            run_hctx.tools_used = result.tools_used
+            run_hctx.stop_reason = result.stop_reason
+            await self.hook.after_run(run_hctx)
 
             # 首轮流式结束时通知渲染器
 
@@ -157,6 +194,10 @@ class AgentRunner:
         result.final_content = messages[-1].get("content", "") or "[达到最大工具调用次数]"
         result.stop_reason = "max_iterations"
 #             await self.on_stream_end(resuming=False)
+        run_hctx.final_content = result.final_content
+        run_hctx.tools_used = result.tools_used
+        run_hctx.stop_reason = result.stop_reason
+        await self.hook.after_run(run_hctx)
         return result
 
     async def _chat_stream_with_tools(
