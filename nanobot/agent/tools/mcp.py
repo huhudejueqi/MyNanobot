@@ -295,7 +295,7 @@ class MCPToolWrapper(_MCPWrapperBase):
                 task = asyncio.current_task()
                 if task is not None and task.cancelling() > 0:
                     raise
-                logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
+                logger.warning("MCP tool '%s' was cancelled by server/SDK", self._name)
                 return "(MCP tool call was cancelled)"
             except Exception as exc:
                 if await self._refresh_session_after_termination(
@@ -396,7 +396,7 @@ class MCPResourceWrapper(_MCPWrapperBase):
                 task = asyncio.current_task()
                 if task is not None and task.cancelling() > 0:
                     raise
-                logger.warning("MCP resource '{}' was cancelled by server/SDK", self._name)
+                logger.warning("MCP resource '%s' was cancelled by server/SDK", self._name)
                 return "(MCP resource read was cancelled)"
             except Exception as exc:
                 if await self._refresh_session_after_termination(
@@ -512,7 +512,7 @@ class MCPPromptWrapper(_MCPWrapperBase):
                 task = asyncio.current_task()
                 if task is not None and task.cancelling() > 0:
                     raise
-                logger.warning("MCP prompt '{}' was cancelled by server/SDK", self._name)
+                logger.warning("MCP prompt '%s' was cancelled by server/SDK", self._name)
                 return "(MCP prompt call was cancelled)"
             except McpError as exc:
                 if await self._refresh_session_after_termination(
@@ -659,31 +659,31 @@ async def connect_mcp_servers(
 
         try:
             # 读取配置指定的传输类型
-            transport_type = cfg.type
+            transport_type = cfg.get('type', '')
             # 未配置传输类型时自动推断
             if not transport_type:
-                if cfg.command:
+                if cfg.get('command'):
                     # 存在启动命令则判定为stdio标准流模式
                     transport_type = "stdio"
-                elif cfg.url:
+                elif cfg.get('url'):
                     # 存在url，根据路径后缀区分sse / streamableHttp
                     transport_type = (
-                        "sse" if cfg.url.rstrip("/").endswith("/sse") else "streamableHttp"
+                        "sse" if cfg.get("url", "").rstrip("/").endswith("/sse") else "streamableHttp"
                     )
                 else:
                     # 无命令、无地址，配置无效，跳过当前服务
-                    logger.warning("MCP server '{}': no command or url configured, skipping", name)
+                    logger.warning("MCP server '%s': no command or url configured, skipping", name)
                     await server_stack.aclose()
                     return name, None
 
             # SSE/流式HTTP 网络传输，先校验URL安全性，拦截危险地址
             if transport_type in {"sse", "streamableHttp"}:
-                ok, error = validate_url_target(cfg.url)
+                ok, error = validate_url_target(cfg.get("url", ""))
                 if not ok:
                     logger.warning(
                         "MCP server '{}': blocked unsafe URL {} ({})",
                         name,
-                        cfg.url,
+                        cfg.get("url", ""),
                         error,
                     )
                     await server_stack.aclose()
@@ -693,16 +693,16 @@ async def connect_mcp_servers(
             if transport_type == "stdio":
                 # 标准化windows下启动命令、参数、环境变量兼容处理
                 command, args, env = _normalize_windows_stdio_command(
-                    cfg.command,
-                    cfg.args,
-                    cfg.env or None,
+                    cfg.get("command"),
+                    cfg.get("args") or [],
+                    cfg.get("env"),
                 )
                 # 组装子进程启动参数
                 params = StdioServerParameters(
                     command=command,
                     args=args,
                     env=env,
-                    cwd=cfg.cwd or None,
+                    cwd=cfg.get("cwd"),
                 )
                 # 创建stdio读写流，交由资源栈托管生命周期
                 read, write = await server_stack.enter_async_context(stdio_client(params))
@@ -710,8 +710,8 @@ async def connect_mcp_servers(
             # 分支2：SSE长连接传输
             elif transport_type == "sse":
                 # 预探测目标地址是否可访问，不可达直接跳过
-                if not await _probe_http_url(cfg.url):
-                    logger.warning("MCP server '{}': {} unreachable, skipping", name, cfg.url)
+                if not await _probe_http_url(cfg.get("url", "")):
+                    logger.warning("MCP server '%s': %s unreachable, skipping", name, cfg.get("url", ""))
                     await server_stack.aclose()
                     return name, None
 
@@ -723,7 +723,7 @@ async def connect_mcp_servers(
                 ) -> httpx.AsyncClient:
                     merged_headers = {
                         "Accept": "application/json, text/event-stream",
-                        **(cfg.headers or {}),
+                        **(cfg.get("headers") or {}),
                         **(headers or {}),
                     }
                     return httpx.AsyncClient(
@@ -736,21 +736,21 @@ async def connect_mcp_servers(
 
                 # 创建sse读写流，资源栈自动释放
                 read, write = await server_stack.enter_async_context(
-                    sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
+                    sse_client(cfg.get("url", ""), httpx_client_factory=httpx_client_factory)
                 )
 
             # 分支3：streamableHttp流式HTTP传输
             elif transport_type == "streamableHttp":
                 # 探测地址连通性
-                if not await _probe_http_url(cfg.url):
-                    logger.warning("MCP server '{}': {} unreachable, skipping", name, cfg.url)
+                if not await _probe_http_url(cfg.get("url", "")):
+                    logger.warning("MCP server '%s': %s unreachable, skipping", name, cfg.get("url", ""))
                     await server_stack.aclose()
                     return name, None
 
                 # 创建独立http客户端，加入资源栈管理
                 http_client = await server_stack.enter_async_context(
                     httpx.AsyncClient(
-                        headers=cfg.headers or None,
+                        headers=cfg.get("headers") or None,
                     
                         follow_redirects=True,
                         timeout=None,
@@ -758,12 +758,12 @@ async def connect_mcp_servers(
                 )
                 # 创建流式http读写流
                 read, write, _ = await server_stack.enter_async_context(
-                    streamable_http_client(cfg.url, http_client=http_client)
+                    streamable_http_client(cfg.get("url", ""), http_client=http_client)
                 )
 
             # 未知传输类型，直接关闭资源并跳过
             else:
-                logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
+                logger.warning("MCP server '%s': unknown transport type '%s'", name, transport_type)
                 await server_stack.aclose()
                 return name, None
 
@@ -775,8 +775,8 @@ async def connect_mcp_servers(
             # 获取服务提供的全部工具列表
             tools = await session.list_tools()
             # 用户配置启用的工具集合
-            enabled_tools = set(cfg.enabled_tools)
-            # *代表启用全部工具标识
+            enabled_tools = set(cfg.get("enabled_tools", ["*"]))
+            # *代表启用全部工具标识；未配置时默认全部启用
             allow_all_tools = "*" in enabled_tools
             registered_count = 0  # 统计注册成功的工具/资源/提示词总数
             matched_enabled_tools: set[str] = set()  # 记录匹配到的启用工具名
@@ -801,9 +801,9 @@ async def connect_mcp_servers(
                     )
                     continue
                 # 封装MCP工具为内部可调用工具对象
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.get("tool_timeout", 30))
                 registry.register(wrapper)
-                logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
+                logger.debug("MCP: registered tool '%s' from server '%s'", wrapper.name, name)
                 registered_count += 1
                 # 记录匹配到的启用工具
                 if enabled_tools:
@@ -830,7 +830,7 @@ async def connect_mcp_servers(
                 resources_result = await session.list_resources()
                 for resource in resources_result.resources:
                     wrapper = MCPResourceWrapper(
-                        session, name, resource, resource_timeout=cfg.tool_timeout
+                        session, name, resource, resource_timeout=cfg.get("tool_timeout", 30)
                     )
                     registry.register(wrapper)
                     registered_count += 1
@@ -838,24 +838,24 @@ async def connect_mcp_servers(
                         "MCP: registered resource '{}' from server '{}'", wrapper.name, name
                     )
             except Exception as e:
-                logger.debug("MCP server '{}': resources not supported or failed: {}", name, e)
+                logger.debug("MCP server '%s': resources not supported or failed: %s", name, e)
 
             # 注册服务提示词列表，捕获异常兼容不支持prompt的服务
             try:
                 prompts_result = await session.list_prompts()
                 for prompt in prompts_result.prompts:
                     wrapper = MCPPromptWrapper(
-                        session, name, prompt, prompt_timeout=cfg.tool_timeout
+                        session, name, prompt, prompt_timeout=cfg.get("tool_timeout", 30)
                     )
                     registry.register(wrapper)
                     registered_count += 1
-                    logger.debug("MCP: registered prompt '{}' from server '{}'", wrapper.name, name)
+                    logger.debug("MCP: registered prompt '%s' from server '%s'", wrapper.name, name)
             except Exception as e:
-                logger.debug("MCP server '{}': prompts not supported or failed: {}", name, e)
+                logger.debug("MCP server '%s': prompts not supported or failed: %s", name, e)
 
             # 输出连接成功日志，打印注册能力总数
             logger.info(
-                "MCP server '{}': connected, {} capabilities registered", name, registered_count
+                "MCP server '%s': connected, %s capabilities registered", name, registered_count
             )
             # 返回当前服务名与专属资源栈
             return name, server_stack
@@ -878,7 +878,7 @@ async def connect_mcp_servers(
                     " Hint: this looks like stdio protocol pollution. Make sure the MCP server writes "
                     "only JSON-RPC to stdout and sends logs/debug output to stderr instead."
                 )
-            logger.exception("MCP server '{}': failed to connect: {}", name, hint)
+            logger.exception("MCP server '%s': failed to connect: %s", name, hint)
             # 忽略关闭时异常，安全释放资源栈
             with suppress(Exception):
                 await server_stack.aclose()
@@ -892,7 +892,7 @@ async def connect_mcp_servers(
         try:
             result = await connect_single_server(name, cfg)
         except Exception as e:
-            logger.exception("MCP server '{}' connection failed: {}", name, e)
+            logger.exception("MCP server '%s' connection failed: %s", name, e)
             continue
         # 连接成功则存入映射字典
         if result is not None and result[1] is not None:

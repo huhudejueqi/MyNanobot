@@ -597,6 +597,7 @@ class AgentLoop:
         不阻塞主循环，可以同时处理多条消息。
         符合原版模式：run 是 1s 监听，dispatch 异步处理。
         """
+        logger.debug(f"self._mcp_servers {self._mcp_servers},self._mcp_connected {self._mcp_connected}")
         if self._mcp_servers and not self._mcp_connected:
             logger.info("连接 MCP 服务器: %s", list(self._mcp_servers))
             connected = await connect_mcp_servers(self._mcp_servers, self.tools)

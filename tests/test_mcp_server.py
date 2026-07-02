@@ -5,9 +5,15 @@ from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 import mcp.types as types
 from datetime import datetime
+from pathlib import Path
 
 
 async def main() -> None:
+    # 启动时记录时间到文件
+    log_path = Path(__file__).resolve().parent.parent / "mcp_test_startup.txt"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(f"MCP test server started at: {datetime.now().isoformat()}\n")
+    
     server = Server("test-mcp")
 
     @server.list_tools()

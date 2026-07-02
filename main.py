@@ -5,7 +5,7 @@
 """
 
 import asyncio
-import logging
+import logging, os
 import sys
 from pathlib import Path
 
@@ -23,7 +23,8 @@ def setup_logging() -> Path:
     log_file.parent.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(str(log_file), encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logging.getLogger("nanobot").setLevel(logging.INFO)
+    log_level = os.environ.get("NANOBOT_LOG_LEVEL", "INFO").upper()
+    logging.getLogger("nanobot").setLevel(getattr(logging, log_level, logging.INFO))
     logging.getLogger("nanobot").addHandler(fh)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
