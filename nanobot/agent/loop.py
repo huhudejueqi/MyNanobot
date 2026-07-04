@@ -1313,7 +1313,7 @@ class AgentLoop:
         for name, stack in self._mcp_stacks.items():
             try:
                 await stack.aclose()
-            except (RuntimeError, BaseExceptionGroup):
+            except (RuntimeError, BaseExceptionGroup, asyncio.CancelledError):
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
         self._mcp_stacks.clear()
 
