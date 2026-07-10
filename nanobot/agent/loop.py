@@ -522,6 +522,263 @@ class AgentLoop:
             unified_session=defaults.unified_session,
             **extra,
         )
+    
+    async def _run_agent_loop(
+        self,
+        initial_messages: list[dict],
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        *,
+        session: Session | None = None,
+        channel: str = "cli",
+        chat_id: str = "direct",
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
+        pending_queue: asyncio.Queue | None = None,
+        ephemeral: bool = False,
+        run_extra_hooks_for_ephemeral: bool = False,
+        hooks: list[AgentHook] | None = None,
+        tools: ToolRegistry | None = None,
+    ) -> tuple[str | None, list[str], list[dict], str, bool]:
+        """
+        执行智能体迭代主循环。
+
+        *on_stream*：流式输出过程中，每产生一段增量文本都会触发该回调。
+        *on_stream_end(resuming)*：单次流式会话结束时触发。
+        参数 `resuming=True` 代表后续还有工具调用（加载动画需重新启动）；
+        参数 `resuming=False` 代表本次为最终回复，流程结束。
+
+        返回元组：(完整输出文本, 已调用工具列表, 完整消息记录, 停止原因, 是否存在注入内容)
+        """
+        # self._sync_subagent_runtime_limits()
+        loop_hook = AgentProgressHook(
+            on_progress=on_progress,
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            metadata=metadata,
+            session_key=session_key,
+            tool_hint_max_length=self.tool_hint_max_length,
+            set_tool_context=self._set_tool_context,
+            on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
+        )
+        # run_hooks = []
+        # for h in self._extra_hooks:
+        #     run_hooks.append(h)
+        # for h in (hooks if hooks is not None else []):
+        #     run_hooks.append(h)
+        run_hooks = [*self._extra_hooks, *(hooks or [])]
+        hook: AgentHook = loop_hook
+        if run_hooks and (not ephemeral or run_extra_hooks_for_ephemeral):
+            # 正常对话（非 ephemeral）
+            # 临时对话但调用方明确要求跑 hook（比如某些需要日志追踪的内部操作）
+            hook = CompositeHook([loop_hook, *run_hooks])# CompositeHook 是一个广播器，把多个 hook 串在一起，每个事件同时触发所有 hook。loop_hook 是主进度钩子（负责推流式内容给前端），*run_hooks 是额外的钩子（比如 _DebugHook 打日志、自定义插件钩子等）。
+        async def _checkpoint(payload: dict[str, Any]) -> None:
+            """保存本轮运行进度到 session.metadata，用于崩溃恢复。"""
+            if session is None:
+                return
+            self._set_runtime_checkpoint(session, payload)
+
+        async def _drain_pending(*, limit: int = _MAX_INJECTIONS_PER_TURN) -> list[dict[str, Any]]:
+            """排干待处理队列，收集后续子 agent 或用户发来的消息。
+
+            用于 ReAct 循环中每轮迭代开始前，将 pending_queue 中的积压消息
+            取出并注入到会话上下文中。
+
+            工作流程：
+            1. 先尽量从 pending_queue 非阻塞取消息（get_nowait），最多 limit 条
+            2. 如果取空了，但还有子 agent（subagent）在运行：
+               - 阻塞等待最多 300 秒，等第一个子 agent 结果
+               - 继续取剩余消息
+               （这是为了保持 runner 循环存活，让后续子 agent 完成结果
+                按顺序注入，而不是被分散到独立的 dispatch 中）
+            3. 每条消息通过 _to_user_message 转为 OpenAI 格式的 user message
+
+            子 agent 场景：主 agent 启动了一组子 agent 并行执行，
+            子 agent 完成后往 pending_queue 发 InboundMessage，
+            _drain_pending 在下一轮迭代前把这些结果注入上下文。
+
+            Returns:
+                list[dict]: 格式为 {"role": "user", "content": ...} 的注入消息列表
+            """
+            if pending_queue is None:
+                return []  # 没有队列可排干
+
+            def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
+                """将 InboundMessage 转为 LLM 使用的 user message 格式。"""
+                content = pending_msg.content
+                media = pending_msg.media if pending_msg.media else None
+                if media:
+                    # 处理附件：文档提取文字，图片分离
+                    content, media = self._prepare_message_media(content, media)
+                    media = media or None
+                # 构建最终 user content（可能含图片/多模态）
+                user_content = self.context._build_user_content(content, media)
+                return {"role": "user", "content": user_content}
+
+            items: list[dict[str, Any]] = []
+            # 第一步：非阻塞取出所有积压消息
+            while len(items) < limit:
+                try:
+                    items.append(_to_user_message(pending_queue.get_nowait()))
+                except asyncio.QueueEmpty:
+                    break  # 队列取空了，跳出
+
+            # 第二步：没有排到消息，但子 agent 还在运行
+            # 阻塞等第一个完成结果，避免 runner 提前退出
+            # 这样后续子 agent 完成的结果可以顺序注入，而不是各自走独立 dispatch
+            if (not items
+                    and session is not None
+                    and self.subagents.get_running_count_by_session(session.key) > 0):
+                try:
+                    msg = await asyncio.wait_for(pending_queue.get(), timeout=300)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Timeout waiting for sub-agent completion in session {}",
+                        session.key,
+                    )
+                    return items  # 超时了，返回已有的 items（此时为空列表）
+                items.append(_to_user_message(msg))
+                # 拿到第一个后，再尝试拿剩余积压的
+                while len(items) < limit:
+                    try:
+                        items.append(_to_user_message(pending_queue.get_nowait()))
+                    except asyncio.QueueEmpty:
+                        break
+
+            return items
+
+
+        # ── 运行时绑定 ──
+        # 在调用 runner 前，将当前请求的上下文信息绑定到全局 ContextVar，
+        # 供工具执行时的路径检查、权限判断等场景使用。
+        active_session_key = session.key if session else session_key  # 当前活跃 session key
+        effective_scope = self.workspace_scopes.for_turn(             # 计算工作区范围（项目路径+访问权限）
+            # 解析策略（workspace_access.py）：
+            # 1. 非 websocket 频道（如 cli）→ 直接返回默认 scope（full 访问整个 workspace）
+            # 2. websocket 频道（WebUI）→ 按以下优先级取 workpace_scope：
+            #    a. 消息元数据 message_metadata["workspace_scope"]（UI 发来的当前项目路径）
+            #    b. 无则回退到 session.metadata["workspace_scope"]（上一轮保留的）
+            #    c. 两边都没有就返回默认 scope
+            # 3. 每个 WorkspaceScope 包含：
+            #    - project_path:      限制文件操作只能在此目录内
+            #    - access_mode:       "restricted" 或 "full"
+            #    - restrict_to_workspace:  是否强制限制
+            #    - sandbox_status:    系统级沙箱状态（基于环境的 NANOBOT_WORKSPACE_* 变量）
+            #    - source_channel:    来源频道标识
+            channel=channel,
+            message_metadata=metadata,
+            session_metadata=session.metadata if session is not None else None,
+        )
+        request_ctx = RequestContext(                                  # 请求上下文（路由/权限用）
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            session_key=active_session_key,
+            metadata=dict(metadata or {}),
+        )
+        # 将当前 session 的文件状态快照绑定到 ContextVar。
+        # FileStateStore 追踪 session 内文件创建/修改的路径和哈希，
+        # 工具（如 read_file）用 FileStates.has_changed() 检测文件变更，
+        # 检测到变更时自动重新读取，避免 LLM 使用过期内容。
+        file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
+        # 将请求上下文（频道、会话 key、元数据）绑定到 ContextVar。
+        # 供 ContextAware 工具（如 MessageTool）在 execute() 中读取，
+        # 知道当前应该往哪个频道/会话发消息。
+        request_token = bind_request_context(request_ctx)
+        # effective_scope 绑定到 ContextVar _CURRENT_WORKSPACE_SCOPE。
+        # 工具执行时通过 current_tool_workspace() 读取：
+        #   - project_path:               限制文件操作只能在此目录内（如 /projects/foo）
+        #   - restrict_to_workspace:      是否强制限制（True → 越界操作会被拒绝）
+        # 按以下链路生效：
+        #   bind_workspace_scope()
+        #     → ContextVar _CURRENT_WORKSPACE_SCOPE
+        #       → current_tool_workspace()  [工具内部调用]
+        #         → is_path_within() 检查路径合法性  [workspace_policy.py]
+        workspace_token = bind_workspace_scope(effective_scope)
+
+        # ── 长期目标续写消息 ──
+        # Compute lazily because long_task may create goal metadata during this run.
+        def _goal_continue() -> str | None:
+            """构造"长期目标继续执行"提示，在 ReAct 超限后注入给 LLM。"""
+            _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
+            if not _goal_lines:
+                return None
+            return (
+                "You have an active sustained goal:\n\n"
+                + "\n".join(_goal_lines)
+                + "\n\nPlease continue working toward the objective using your tools, "
+                "or call complete_goal if the work is truly finished."
+            )
+
+        session_metadata = session.metadata if session is not None else None
+        try:
+            # ── 调用 AgentRunner.run() 启动 ReAct 循环 ──
+            result = await self.runner.run(AgentRunSpec(
+                initial_messages=initial_messages,
+                tools=tools or self.tools,
+                model=self.model,
+                max_iterations=self.max_iterations,               # ReAct 最大轮次
+                max_tool_result_chars=self.max_tool_result_chars,  # 工具结果截断长度
+                hook=hook,                                         # 钩子链（进度推送 + 调试日志 + 自定义）
+                error_message="Sorry, I encountered an error calling the AI model.",
+                concurrent_tools=True,                              # 允许工具并行执行
+                workspace=effective_scope.project_path,             # 工具执行的 cwd（项目隔离）
+                session_key=session.key if session else None,       # session 标识，用于 checkpoint
+                context_window_tokens=self.context_window_tokens,   # 上下文窗口大小
+                context_block_limit=self.context_block_limit,       # 上下文块数上限（更精细的裁剪）
+                provider_retry_mode=self.provider_retry_mode,       # LLM 重试策略
+                progress_callback=on_progress,                       # 进度通知回调
+                stream_progress_deltas=on_stream is not None,        # 非流式时是否用进度增量代替
+                retry_wait_callback=on_retry_wait,                   # 重试间隔回调
+                checkpoint_callback=_checkpoint,                     # 每步保存进度到 session.metadata
+                injection_callback=_drain_pending,                   # 排干待处理消息队列
+                # 长期目标期间不设外层超时；流式 provider 由 STREAM_IDLE_TIMEOUT_S 兜底
+                llm_timeout_s=runner_wall_llm_timeout_s(
+                    self.sessions,
+                    session.key if session is not None else session_key,
+                    metadata=session_metadata,
+                    message_metadata=metadata,
+                ),
+                goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
+                goal_continue_message=_goal_continue,
+                finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
+                    pending_queue_available=pending_queue is not None and session is not None,
+                    session_metadata=session_metadata,
+                    message_metadata=metadata,
+                ),
+            ))
+        finally:
+            # ── 清理运行时绑定 ──
+            # ContextVar 的 .set() 返回 token，reset 恢复旧值，防止影响后续请求
+            reset_workspace_scope(workspace_token)
+            reset_request_context(request_token)
+            reset_file_states(file_state_token)
+
+        # ── 结果后处理 ──
+        self._last_usage = result.usage  # 保存 token 用量供外面查
+        if result.stop_reason == "max_iterations":
+            logger.warning("Max iterations ({}) reached", self.max_iterations)
+            should_stream = turn_continuation.should_stream_budget_response(
+                stop_reason=result.stop_reason,
+                pending_queue_available=pending_queue is not None and session is not None,
+                session_metadata=session_metadata,
+                message_metadata=metadata,
+            )
+            # 流式频道（如飞书）超限后推送最终内容刷新卡片，避免前端一直显示"加载中"
+            if on_stream and on_stream_end and should_stream:
+                await on_stream(result.final_content or "")
+                await on_stream_end(resuming=False)
+        elif result.stop_reason == "error":
+            logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
+
+
 
     # ── 状态机驱动（异步处理，不阻塞主循环） ──
 
@@ -961,6 +1218,25 @@ class AgentLoop:
     async def _state_save(self, ctx: TurnContext) -> str:
         logger.info("_state_save")
         turn_continuation.prepare_save_boundary(ctx)
+        if (
+            (ctx.final_content is None or not ctx.final_content.strip())
+            and not ctx.suppress_response
+        ):
+            ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
+            """
+            EMPTY_FINAL_RESPONSE_MESSAGE = (
+                    "I completed the tool steps but couldn't produce a final answer. "
+                    "Please try again or narrow the task."
+                )
+            """
+
+        latency_started_at = (
+            ctx.visible_run_started_at
+            if turn_continuation.internal_continuation_inbound(ctx.msg.metadata)
+            and ctx.visible_run_started_at is not None
+            else ctx.turn_wall_started_at
+        )
+        
         if ctx.session is not None and ctx.all_messages:
             ctx.session.messages = list(ctx.all_messages)
             self.sessions.save(ctx.session)
@@ -990,262 +1266,78 @@ class AgentLoop:
         )
         return "ok"
 
-    async def _run_agent_loop(
+    def _save_turn(
         self,
-        initial_messages: list[dict],
-        on_progress: Callable[..., Awaitable[None]] | None = None,
-        on_stream: Callable[[str], Awaitable[None]] | None = None,
-        on_stream_end: Callable[..., Awaitable[None]] | None = None,
-        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        session: Session,
+        messages: list[dict],
+        skip: int,
         *,
-        session: Session | None = None,
-        channel: str = "cli",
-        chat_id: str = "direct",
-        message_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        session_key: str | None = None,
-        pending_queue: asyncio.Queue | None = None,
-        ephemeral: bool = False,
-        run_extra_hooks_for_ephemeral: bool = False,
-        hooks: list[AgentHook] | None = None,
-        tools: ToolRegistry | None = None,
-    ) -> tuple[str | None, list[str], list[dict], str, bool]:
-        """
-        执行智能体迭代主循环。
+        turn_latency_ms: int | None = None,
+    ) -> None:
+        """Save new-turn messages into session, truncating large tool results."""
+        from datetime import datetime
 
-        *on_stream*：流式输出过程中，每产生一段增量文本都会触发该回调。
-        *on_stream_end(resuming)*：单次流式会话结束时触发。
-        参数 `resuming=True` 代表后续还有工具调用（加载动画需重新启动）；
-        参数 `resuming=False` 代表本次为最终回复，流程结束。
-
-        返回元组：(完整输出文本, 已调用工具列表, 完整消息记录, 停止原因, 是否存在注入内容)
-        """
-        # self._sync_subagent_runtime_limits()
-        loop_hook = AgentProgressHook(
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            channel=channel,
-            chat_id=chat_id,
-            message_id=message_id,
-            metadata=metadata,
-            session_key=session_key,
-            tool_hint_max_length=self.tool_hint_max_length,
-            set_tool_context=self._set_tool_context,
-            on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
-        )
-        # run_hooks = []
-        # for h in self._extra_hooks:
-        #     run_hooks.append(h)
-        # for h in (hooks if hooks is not None else []):
-        #     run_hooks.append(h)
-        run_hooks = [*self._extra_hooks, *(hooks or [])]
-        hook: AgentHook = loop_hook
-        if run_hooks and (not ephemeral or run_extra_hooks_for_ephemeral):
-            # 正常对话（非 ephemeral）
-            # 临时对话但调用方明确要求跑 hook（比如某些需要日志追踪的内部操作）
-            hook = CompositeHook([loop_hook, *run_hooks])# CompositeHook 是一个广播器，把多个 hook 串在一起，每个事件同时触发所有 hook。loop_hook 是主进度钩子（负责推流式内容给前端），*run_hooks 是额外的钩子（比如 _DebugHook 打日志、自定义插件钩子等）。
-        async def _checkpoint(payload: dict[str, Any]) -> None:
-            """保存本轮运行进度到 session.metadata，用于崩溃恢复。"""
-            if session is None:
-                return
-            self._set_runtime_checkpoint(session, payload)
-
-        async def _drain_pending(*, limit: int = _MAX_INJECTIONS_PER_TURN) -> list[dict[str, Any]]:
-            """排干待处理队列，收集后续子 agent 或用户发来的消息。
-
-            用于 ReAct 循环中每轮迭代开始前，将 pending_queue 中的积压消息
-            取出并注入到会话上下文中。
-
-            工作流程：
-            1. 先尽量从 pending_queue 非阻塞取消息（get_nowait），最多 limit 条
-            2. 如果取空了，但还有子 agent（subagent）在运行：
-               - 阻塞等待最多 300 秒，等第一个子 agent 结果
-               - 继续取剩余消息
-               （这是为了保持 runner 循环存活，让后续子 agent 完成结果
-                按顺序注入，而不是被分散到独立的 dispatch 中）
-            3. 每条消息通过 _to_user_message 转为 OpenAI 格式的 user message
-
-            子 agent 场景：主 agent 启动了一组子 agent 并行执行，
-            子 agent 完成后往 pending_queue 发 InboundMessage，
-            _drain_pending 在下一轮迭代前把这些结果注入上下文。
-
-            Returns:
-                list[dict]: 格式为 {"role": "user", "content": ...} 的注入消息列表
-            """
-            if pending_queue is None:
-                return []  # 没有队列可排干
-
-            def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
-                """将 InboundMessage 转为 LLM 使用的 user message 格式。"""
-                content = pending_msg.content
-                media = pending_msg.media if pending_msg.media else None
-                if media:
-                    # 处理附件：文档提取文字，图片分离
-                    content, media = self._prepare_message_media(content, media)
-                    media = media or None
-                # 构建最终 user content（可能含图片/多模态）
-                user_content = self.context._build_user_content(content, media)
-                return {"role": "user", "content": user_content}
-
-            items: list[dict[str, Any]] = []
-            # 第一步：非阻塞取出所有积压消息
-            while len(items) < limit:
-                try:
-                    items.append(_to_user_message(pending_queue.get_nowait()))
-                except asyncio.QueueEmpty:
-                    break  # 队列取空了，跳出
-
-            # 第二步：没有排到消息，但子 agent 还在运行
-            # 阻塞等第一个完成结果，避免 runner 提前退出
-            # 这样后续子 agent 完成的结果可以顺序注入，而不是各自走独立 dispatch
-            if (not items
-                    and session is not None
-                    and self.subagents.get_running_count_by_session(session.key) > 0):
-                try:
-                    msg = await asyncio.wait_for(pending_queue.get(), timeout=300)
-                except asyncio.TimeoutError:
+        declared_tool_call_ids = {
+            str(tc["id"])
+            for m in session.messages
+            if m.get("role") == "assistant"
+            for tc in m.get("tool_calls") or []
+            if isinstance(tc, dict) and tc.get("id")
+        }
+        last_assistant_idx: int | None = None
+        for m in messages[skip:]:
+            entry = dict(m)
+            role, content = entry.get("role"), entry.get("content")
+            if role == "assistant" and not content and not entry.get("tool_calls"):
+                continue  # skip empty assistant messages — they poison session context
+            if role == "tool":
+                tool_call_id = entry.get("tool_call_id")
+                if not tool_call_id or str(tool_call_id) not in declared_tool_call_ids:
+                    # Undeclared tool results corrupt future provider requests.
                     logger.warning(
-                        "Timeout waiting for sub-agent completion in session {}",
+                        "Dropping orphaned tool result {} from session {} during persistence",
+                        tool_call_id or "(missing id)",
                         session.key,
                     )
-                    return items  # 超时了，返回已有的 items（此时为空列表）
-                items.append(_to_user_message(msg))
-                # 拿到第一个后，再尝试拿剩余积压的
-                while len(items) < limit:
-                    try:
-                        items.append(_to_user_message(pending_queue.get_nowait()))
-                    except asyncio.QueueEmpty:
-                        break
+                    continue
+                if isinstance(content, str) and len(content) > self.max_tool_result_chars:
+                    entry["content"] = truncate_text_fn(content, self.max_tool_result_chars)
+                elif isinstance(content, list):
+                    filtered = self._sanitize_persisted_blocks(content, should_truncate_text=True)
+                    if not filtered:
+                        # Preserve the tool_call/result pair after block filtering.
+                        filtered = [
+                            {"type": "text", "text": "[tool result omitted during persistence]"}
+                        ]
+                    entry["content"] = filtered
+            elif role == "user":
+                if isinstance(content, str) and ContextBuilder._RUNTIME_CONTEXT_TAG in content:
+                    # Strip the runtime-context block appended at the end.
+                    tag_pos = content.find(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                    before = content[:tag_pos].rstrip("\n ")
+                    if before:
+                        entry["content"] = before
+                    else:
+                        continue
+                if isinstance(content, list):
+                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
+                    if not filtered:
+                        continue
+                    entry["content"] = filtered
+            entry.setdefault("timestamp", datetime.now().isoformat())
+            session.messages.append(entry)
+            if role == "assistant":
+                last_assistant_idx = len(session.messages) - 1
+                declared_tool_call_ids.update(
+                    str(tc["id"])
+                    for tc in entry.get("tool_calls") or []
+                    if isinstance(tc, dict) and tc.get("id")
+                )
+        if turn_latency_ms is not None and last_assistant_idx is not None:
+            session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
+        session.updated_at = datetime.now()
 
-            return items
-
-
-        # ── 运行时绑定 ──
-        # 在调用 runner 前，将当前请求的上下文信息绑定到全局 ContextVar，
-        # 供工具执行时的路径检查、权限判断等场景使用。
-        active_session_key = session.key if session else session_key  # 当前活跃 session key
-        effective_scope = self.workspace_scopes.for_turn(             # 计算工作区范围（项目路径+访问权限）
-            # 解析策略（workspace_access.py）：
-            # 1. 非 websocket 频道（如 cli）→ 直接返回默认 scope（full 访问整个 workspace）
-            # 2. websocket 频道（WebUI）→ 按以下优先级取 workpace_scope：
-            #    a. 消息元数据 message_metadata["workspace_scope"]（UI 发来的当前项目路径）
-            #    b. 无则回退到 session.metadata["workspace_scope"]（上一轮保留的）
-            #    c. 两边都没有就返回默认 scope
-            # 3. 每个 WorkspaceScope 包含：
-            #    - project_path:      限制文件操作只能在此目录内
-            #    - access_mode:       "restricted" 或 "full"
-            #    - restrict_to_workspace:  是否强制限制
-            #    - sandbox_status:    系统级沙箱状态（基于环境的 NANOBOT_WORKSPACE_* 变量）
-            #    - source_channel:    来源频道标识
-            channel=channel,
-            message_metadata=metadata,
-            session_metadata=session.metadata if session is not None else None,
-        )
-        request_ctx = RequestContext(                                  # 请求上下文（路由/权限用）
-            channel=channel,
-            chat_id=chat_id,
-            message_id=message_id,
-            session_key=active_session_key,
-            metadata=dict(metadata or {}),
-        )
-        # 将当前 session 的文件状态快照绑定到 ContextVar。
-        # FileStateStore 追踪 session 内文件创建/修改的路径和哈希，
-        # 工具（如 read_file）用 FileStates.has_changed() 检测文件变更，
-        # 检测到变更时自动重新读取，避免 LLM 使用过期内容。
-        file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
-        # 将请求上下文（频道、会话 key、元数据）绑定到 ContextVar。
-        # 供 ContextAware 工具（如 MessageTool）在 execute() 中读取，
-        # 知道当前应该往哪个频道/会话发消息。
-        request_token = bind_request_context(request_ctx)
-        # effective_scope 绑定到 ContextVar _CURRENT_WORKSPACE_SCOPE。
-        # 工具执行时通过 current_tool_workspace() 读取：
-        #   - project_path:               限制文件操作只能在此目录内（如 /projects/foo）
-        #   - restrict_to_workspace:      是否强制限制（True → 越界操作会被拒绝）
-        # 按以下链路生效：
-        #   bind_workspace_scope()
-        #     → ContextVar _CURRENT_WORKSPACE_SCOPE
-        #       → current_tool_workspace()  [工具内部调用]
-        #         → is_path_within() 检查路径合法性  [workspace_policy.py]
-        workspace_token = bind_workspace_scope(effective_scope)
-
-        # ── 长期目标续写消息 ──
-        # Compute lazily because long_task may create goal metadata during this run.
-        def _goal_continue() -> str | None:
-            """构造"长期目标继续执行"提示，在 ReAct 超限后注入给 LLM。"""
-            _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
-            if not _goal_lines:
-                return None
-            return (
-                "You have an active sustained goal:\n\n"
-                + "\n".join(_goal_lines)
-                + "\n\nPlease continue working toward the objective using your tools, "
-                "or call complete_goal if the work is truly finished."
-            )
-
-        session_metadata = session.metadata if session is not None else None
-        try:
-            # ── 调用 AgentRunner.run() 启动 ReAct 循环 ──
-            result = await self.runner.run(AgentRunSpec(
-                initial_messages=initial_messages,
-                tools=tools or self.tools,
-                model=self.model,
-                max_iterations=self.max_iterations,               # ReAct 最大轮次
-                max_tool_result_chars=self.max_tool_result_chars,  # 工具结果截断长度
-                hook=hook,                                         # 钩子链（进度推送 + 调试日志 + 自定义）
-                error_message="Sorry, I encountered an error calling the AI model.",
-                concurrent_tools=True,                              # 允许工具并行执行
-                workspace=effective_scope.project_path,             # 工具执行的 cwd（项目隔离）
-                session_key=session.key if session else None,       # session 标识，用于 checkpoint
-                context_window_tokens=self.context_window_tokens,   # 上下文窗口大小
-                context_block_limit=self.context_block_limit,       # 上下文块数上限（更精细的裁剪）
-                provider_retry_mode=self.provider_retry_mode,       # LLM 重试策略
-                progress_callback=on_progress,                       # 进度通知回调
-                stream_progress_deltas=on_stream is not None,        # 非流式时是否用进度增量代替
-                retry_wait_callback=on_retry_wait,                   # 重试间隔回调
-                checkpoint_callback=_checkpoint,                     # 每步保存进度到 session.metadata
-                injection_callback=_drain_pending,                   # 排干待处理消息队列
-                # 长期目标期间不设外层超时；流式 provider 由 STREAM_IDLE_TIMEOUT_S 兜底
-                llm_timeout_s=runner_wall_llm_timeout_s(
-                    self.sessions,
-                    session.key if session is not None else session_key,
-                    metadata=session_metadata,
-                    message_metadata=metadata,
-                ),
-                goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
-                goal_continue_message=_goal_continue,
-                finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
-                    pending_queue_available=pending_queue is not None and session is not None,
-                    session_metadata=session_metadata,
-                    message_metadata=metadata,
-                ),
-            ))
-        finally:
-            # ── 清理运行时绑定 ──
-            # ContextVar 的 .set() 返回 token，reset 恢复旧值，防止影响后续请求
-            reset_workspace_scope(workspace_token)
-            reset_request_context(request_token)
-            reset_file_states(file_state_token)
-
-        # ── 结果后处理 ──
-        self._last_usage = result.usage  # 保存 token 用量供外面查
-        if result.stop_reason == "max_iterations":
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
-            should_stream = turn_continuation.should_stream_budget_response(
-                stop_reason=result.stop_reason,
-                pending_queue_available=pending_queue is not None and session is not None,
-                session_metadata=session_metadata,
-                message_metadata=metadata,
-            )
-            # 流式频道（如飞书）超限后推送最终内容刷新卡片，避免前端一直显示"加载中"
-            if on_stream and on_stream_end and should_stream:
-                await on_stream(result.final_content or "")
-                await on_stream_end(resuming=False)
-        elif result.stop_reason == "error":
-            logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
-
-
+   
 
 
     # ── 主循环：1 秒轮询 + dispatch 异步化 ──

@@ -142,6 +142,37 @@ async def maybe_continue_turn(ctx: Any) -> bool:
 
 def prepare_save_boundary(ctx: Any) -> None:
     """准备续写状态记账与历史追加分界标识"""
+
+    # ── 场景举例 ──
+    # 用户发了两条消息，第一条触发了 goal continuation（多轮 LLM 调用）:
+    #
+    #   用户: "帮我写一个排序算法"
+    #       ↓
+    #   状态机: RESTORE → COMPACT → BUILD → RUN
+    #       ↓
+    #   LLM 返回了 sort.py，但 max_iterations 没跑完
+    #       ↓
+    #   触发 continuation → 等待下一条用户消息
+    #
+    #   用户: "再加个测试用例"
+    #       ↓
+    #   状态机: RESTORE → COMPACT → BUILD → RUN → SAVE
+    #                                            ↑
+    #                                 prepare_save_boundary 在这里
+
+    # ── 清除续行状态 ──
+    # 上一轮 continuation 在 session.metadata 里留了标记
+    # （如 _GOAL_CONTINUATION_ROUNDS_KEY 等）。
+    # 不清理的话，下次续行会误判轮次计数。
+    #
+    # ── 计算 save_skip ──
+    # continuation 启动时预存了用户消息（user_persisted_early），
+    # 此时 session.messages 里可能有重复内容：
+    #   [0] 用户:"帮我写一个排序算法"  (预存)
+    #   [1] 助手: sort.py              (第一轮)
+    #   [2] 用户:"再加个测试用例"      (新消息，未存)
+    #   [3] 助手: test_sort.py          (当前轮，未存)
+    # save_skip = 1 → 跳过[0]，从[1]开始存，避免预存的消息重复。
     logger.debug("prepare_save_boundary {}", ctx)
     if ctx.session is not None:
         clear_internal_continuation_state(ctx.session.metadata)

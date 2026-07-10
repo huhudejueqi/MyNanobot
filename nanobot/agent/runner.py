@@ -226,6 +226,7 @@ class AgentRunner:
                 len(injections), phase, injection_cycles, _MAX_INJECTION_CYCLES,
             )
         else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
             logger.info("Injected sustained-goal continuation {}", phase)
         return True, injection_cycles
 
@@ -261,6 +262,7 @@ class AgentRunner:
             if accepts_limit:
                 items = await spec.injection_callback(limit=_MAX_INJECTIONS_PER_TURN)
             else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
                 items = await spec.injection_callback()
         except Exception:
             logger.exception("injection_callback failed")
@@ -343,6 +345,7 @@ class AgentRunner:
             await hook.on_error(context)
             raise
         else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
             context.messages = deepcopy(result.messages)
             context.final_content = result.final_content
             context.tools_used = list(result.tools_used)
@@ -361,6 +364,7 @@ class AgentRunner:
             if context.exception is None:
                 await hook.on_finally(context)
             else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
                 try:
                     await hook.on_finally(context)
                 except Exception:
@@ -601,6 +605,8 @@ class AgentRunner:
             # 分支 3：空内容处理 —— 模型返回空文本时的重试逻辑
             # ================================================================
             clean = hook.finalize_content(context, response.content)
+            # logger.debug(f"_run_core finalize_content clean {clean}")
+            # logger.debug(f"_run_core finalize_content cleaned_content {cleaned_content}")
             if response.finish_reason != "error" and is_blank_text(clean):
                 empty_content_retries += 1
                 if empty_content_retries < _MAX_EMPTY_RETRIES:
@@ -696,16 +702,21 @@ class AgentRunner:
             if response.finish_reason == "error":
                 # --- 区分欠费错误与普通 LLM 错误 ---
                 if LLMProvider.is_arrearage_response(response):
+                    # 欠费：返回固定提示，不暴露具体错误详情
                     final_content = _ARREARAGE_ERROR_MESSAGE
                 else:
+                    # 普通 LLM 错误（超时、限流、服务不可用等）
+                    # 优先取清洗后的内容，其次自定义错误消息，最后默认兜底
                     final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"
                 error = final_content
+                # 在消息列表中插入空占位，维持角色交替，避免下游 compaction 断链
                 self._append_model_error_placeholder(messages)
                 context.final_content = final_content
                 context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
+                # 错误后仍检查是否有用户新消息注入，有则继续处理而非直接结束
                 should_continue, injection_cycles = await self._try_drain_injections(
                     spec, messages, None, injection_cycles,
                     phase="after LLM error",
@@ -714,7 +725,6 @@ class AgentRunner:
                     had_injections = True
                     continue
                 break
-
             # ================================================================
             # 分支 7：重试后仍为空内容 —— 标记为空最终响应
             # ================================================================
@@ -761,6 +771,7 @@ class AgentRunner:
             await hook.after_iteration(context)
             break
         else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
             # ================================================================
             # max_iterations 耗尽 —— 循环自然结束（未 break）
             # ================================================================
@@ -926,6 +937,7 @@ class AgentRunner:
                 on_tool_call_delta=_tool_call_delta if live_file_edits is not None else None,
             )
         else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
             coro = self.provider.chat_with_retry(**kwargs)
 
         # Streaming requests already have provider-level idle timeouts
@@ -1138,6 +1150,7 @@ class AgentRunner:
                 ))
                 tool_results.extend(batch_results)
             else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
                 batch_results = []
                 for tool_call in batch:
                     result = await self._run_tool(
@@ -1231,6 +1244,7 @@ class AgentRunner:
             if tool is not None:
                 result = await tool.execute(**params)
             else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
                 result = await spec.tools.execute(tool_call.name, params)
         except asyncio.CancelledError:
             raise
@@ -1629,6 +1643,7 @@ class AgentRunner:
                     kept = kept[i:]
                     break
             else:
+                # 普通 LLM 错误（超时、限流、服务不可用等）
                 # Recover nearest user message from outside the kept window;
                 # GLM rejects system→assistant (error 1214).  Budget is
                 # intentionally exceeded — oversized beats invalid.

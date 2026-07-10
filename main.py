@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import concurrent.futures
 import logging, os
 import sys
 import subprocess
@@ -102,6 +103,8 @@ def main():
     except KeyboardInterrupt:
         print("\n退出。")
     finally:
+        # anyio 的 cancel_scope 在 asyncio.run() shutdown 时会报不兼容错误，
+        # 这是 mcp 库的已知问题，不影响正常退出，静默忽略。
         _stop_mcp_servers()
 
 
