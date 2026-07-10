@@ -5,61 +5,27 @@ from pathlib import Path
 
 from loguru import logger
 
-from nanobot.utils.helpers import detect_image_mime
 
 # Supported file extensions for text extraction
 SUPPORTED_EXTENSIONS: set[str] = {
-    # Document formats
-    ".pdf",
-    ".docx",
-    ".xlsx",
-    ".pptx",
-    # Text formats
-    ".txt",
-    ".md",
-    ".csv",
-    ".json",
-    ".xml",
-    ".html",
-    ".htm",
-    ".log",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".ini",
-    ".cfg",
-    # Image formats (for future OCR support)
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
+    ".pdf", ".docx", ".xlsx", ".pptx",
+    ".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm",
+    ".log", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp",
 }
 
 _MAX_TEXT_LENGTH = 200_000
 
 
 def extract_text(path: Path) -> str | None:
-    """Extract text from a file.
-
-    Args:
-        path: Path to the file.
-
-    Returns:
-        Extracted text as string, None for unsupported types,
-        or error string for failures.
-    """
+    """Extract text from a file."""
     if not isinstance(path, Path):
         path = Path(path)
-
     if not path.exists():
         return f"[error: file not found: {path}]"
 
     ext = path.suffix.lower()
 
-    # Document formats -- each branch lazily imports its parser so that
-    # startup does not pay the ~25 MB cost of loading openpyxl /
-    # python-docx / python-pptx / pypdf up front (see issue #3422).
     if ext == ".pdf":
         return _extract_pdf(path)
     elif ext == ".docx":
@@ -71,48 +37,41 @@ def extract_text(path: Path) -> str | None:
     elif _is_text_extension(ext):
         return _extract_text_file(path)
     elif ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
-        # Image files - for future OCR support
         return f"[image: {path.name}]"
     else:
-        # Unsupported extension
         return None
 
 
 def _extract_pdf(path: Path) -> str:
-    """Extract text from PDF using pypdf."""
     try:
         from pypdf import PdfReader
     except ImportError:
         return "[error: pypdf not installed]"
     try:
         reader = PdfReader(path)
-        pages: list[str] = []
+        pages = []
         for i, page in enumerate(reader.pages, 1):
             text = page.extract_text() or ""
             pages.append(f"--- Page {i} ---\n{text}")
         return _truncate("\n\n".join(pages), _MAX_TEXT_LENGTH)
     except Exception as e:
-        logger.exception("Failed to extract PDF {}", path)
         return f"[error: failed to extract PDF: {e!s}]"
 
 
 def _extract_docx(path: Path) -> str:
-    """Extract text from DOCX using python-docx."""
     try:
         from docx import Document as DocxDocument
     except ImportError:
         return "[error: python-docx not installed]"
     try:
         doc = DocxDocument(path)
-        paragraphs: list[str] = [p.text for p in doc.paragraphs if p.text.strip()]
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
         return _truncate("\n\n".join(paragraphs), _MAX_TEXT_LENGTH)
     except Exception as e:
-        logger.exception("Failed to extract DOCX {}", path)
         return f"[error: failed to extract DOCX: {e!s}]"
 
 
 def _extract_xlsx(path: Path) -> str:
-    """Extract text from XLSX using openpyxl."""
     try:
         from openpyxl import load_workbook
     except ImportError:
@@ -120,10 +79,10 @@ def _extract_xlsx(path: Path) -> str:
     try:
         wb = load_workbook(path, read_only=True, data_only=True)
         try:
-            sheets: list[str] = []
+            sheets = []
             for sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
-                rows: list[str] = []
+                rows = []
                 for row in ws.iter_rows(values_only=True):
                     row_text = "\t".join(str(cell) if cell is not None else "" for cell in row)
                     if row_text.strip():
@@ -134,43 +93,34 @@ def _extract_xlsx(path: Path) -> str:
         finally:
             wb.close()
     except Exception as e:
-        logger.exception("Failed to extract XLSX {}", path)
         return f"[error: failed to extract XLSX: {e!s}]"
 
 
 def _extract_pptx(path: Path) -> str:
-    """Extract text from PPTX using python-pptx."""
     try:
         from pptx import Presentation as PptxPresentation
     except ImportError:
         return "[error: python-pptx not installed]"
     try:
         prs = PptxPresentation(path)
-        slides: list[str] = []
+        slides = []
         for i, slide in enumerate(prs.slides, 1):
-            slide_text: list[str] = []
+            slide_text = []
             for shape in slide.shapes:
                 _collect_pptx_shape_text(shape, slide_text)
             if slide_text:
                 slides.append(f"--- Slide {i} ---\n" + "\n".join(slide_text))
         return _truncate("\n\n".join(slides), _MAX_TEXT_LENGTH)
     except Exception as e:
-        logger.exception("Failed to extract PPTX {}", path)
         return f"[error: failed to extract PPTX: {e!s}]"
 
 
 def _collect_pptx_shape_text(shape, out: list[str]) -> None:
-    """Collect text from a PPTX shape, recursing into groups and tables.
-
-    Groups have ``has_text_frame=False`` and must be walked via ``.shapes``;
-    tables are GraphicFrame objects whose cell text lives under ``.table``.
-    """
     sub_shapes = getattr(shape, "shapes", None)
     if sub_shapes is not None:
         for sub in sub_shapes:
             _collect_pptx_shape_text(sub, out)
         return
-
     if getattr(shape, "has_table", False):
         for row in shape.table.rows:
             cells = [cell.text.strip() for cell in row.cells]
@@ -178,88 +128,77 @@ def _collect_pptx_shape_text(shape, out: list[str]) -> None:
             if line:
                 out.append(line)
         return
-
     text = getattr(shape, "text", "")
     if text:
         out.append(text)
 
 
 def _extract_text_file(path: Path) -> str:
-    """Extract text from a plain text file."""
     try:
-        # Try UTF-8 first, then latin-1 fallback
         try:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             content = path.read_text(encoding="latin-1")
         return _truncate(content, _MAX_TEXT_LENGTH)
     except Exception as e:
-        logger.exception("Failed to read text file {}", path)
         return f"[error: failed to read file: {e!s}]"
 
 
 def _truncate(text: str, max_length: int) -> str:
-    """Truncate text with a suffix indicating truncation."""
     if len(text) <= max_length:
         return text
     return text[:max_length] + f"... (truncated, {len(text)} chars total)"
 
 
 def _is_text_extension(ext: str) -> bool:
-    """Check if extension is a text format."""
     return ext in {
-        ".txt",
-        ".md",
-        ".csv",
-        ".json",
-        ".xml",
-        ".html",
-        ".htm",
-        ".log",
-        ".yaml",
-        ".yml",
-        ".toml",
-        ".ini",
-        ".cfg",
+        ".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm",
+        ".log", ".yaml", ".yml", ".toml", ".ini", ".cfg",
     }
 
 
-# ---------------------------------------------------------------------------
-# High-level helper: split media into images + extracted document text
-# ---------------------------------------------------------------------------
+# ── Image detection ──
 
-_MAX_EXTRACT_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+def detect_image_mime(data: bytes) -> str | None:
+    """Detect image MIME type from the first bytes of a file."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:2] in (b"\xff\xd8",):
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def is_image_file(path: str) -> bool:
-    """Check whether *path* looks like an image file.
-
-    Uses magic-byte detection (reads first 16 bytes) with a ``mimetypes``
-    extension-based fallback.
-    """
+    """Check whether a path looks like an image file."""
     p = Path(path)
-    mime: str | None = None
+    mime = None
     if p.is_file():
         try:
             with p.open("rb") as f:
                 mime = detect_image_mime(f.read(16))
         except OSError:
-            mime = None
+            pass
     if not mime:
         mime = mimetypes.guess_type(path)[0]
     return bool(mime and mime.startswith("image/"))
 
 
-def reference_non_image_attachments(
-    content: str, media: list[str],
-) -> tuple[str, list[str]]:
-    """Separate images from non-image attachments without reading file content.
+def image_placeholder_text(path: str | None = None, *, empty: str = "[image]") -> str:
+    """Generate placeholder text for an image."""
+    if path:
+        name = Path(path).name
+        return f"[image: {name}]"
+    return empty
 
-    Image paths are preserved for downstream vision-block construction.
-    Non-image paths are appended as ``[Attachment: path]`` references.
-    """
-    image_paths: list[str] = []
-    attachment_refs: list[str] = []
+
+def reference_non_image_attachments(content: str, media: list[str]) -> tuple[str, list[str]]:
+    """Separate images from non-image attachments, just referencing them."""
+    image_paths = []
+    attachment_refs = []
     for path in media:
         if is_image_file(path):
             image_paths.append(path)
@@ -271,24 +210,22 @@ def reference_non_image_attachments(
     return content, image_paths
 
 
+_MAX_EXTRACT_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+
 def extract_documents(
     text: str,
     media_paths: list[str],
     *,
     max_file_size: int = _MAX_EXTRACT_FILE_SIZE,
 ) -> tuple[str, list[str]]:
-    """Separate images from documents in *media_paths*.
+    """Separate images from documents in media_paths.
 
-    Documents (PDF, DOCX, XLSX, PPTX, plain-text, …) have their text
-    extracted and appended to *text*.  Only image paths are kept in the
-    returned list so that downstream layers only need to handle vision
-    blocks.
-
-    Files larger than *max_file_size* bytes are skipped with a warning
-    to avoid unbounded memory / CPU usage.
+    Documents have their text extracted and appended to text.
+    Only image paths are kept in the returned list.
     """
-    image_paths: list[str] = []
-    doc_texts: list[str] = []
+    image_paths = []
+    doc_texts = []
 
     for path_str in media_paths:
         p = Path(path_str)
@@ -301,7 +238,7 @@ def extract_documents(
             continue
         if size > max_file_size:
             logger.warning(
-                "Skipping oversized file for extraction: {} ({:.1f} MB > {} MB limit)",
+                "Skipping oversized file: {} ({:.1f} MB > {} MB limit)",
                 p.name, size / (1024 * 1024), max_file_size // (1024 * 1024),
             )
             continue

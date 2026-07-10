@@ -1,4 +1,11 @@
-"""Configuration schema using Pydantic."""
+"""全局配置模式定义（基于 Pydantic）。
+
+包含所有配置节的数据类：
+  - Config: 根配置（providers, channels, cron, tools 等）
+  - ChannelsConfig: 频道配置
+  - ProviderConfig: LLM 提供者配置
+  - 各类工具配置
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class ChannelsConfig(Base):
-    """Configuration for chat channels.
+    """聊天频道配置。
 
     Built-in and plugin channel configs are stored as extra fields (dicts).
     Each channel parses its own config in __init__.
@@ -29,20 +36,20 @@ class ChannelsConfig(Base):
 
     model_config = ConfigDict(extra="allow")
 
-    send_progress: bool = True  # stream agent's text progress to the channel
-    send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
-    show_reasoning: bool = True  # surface model reasoning when channel implements it
-    extract_document_text: bool = True  # extract text from document attachments before sending to the model
-    send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
-    transcription_provider: str = "groq"  # Deprecated: use top-level transcription.provider
-    transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Deprecated: use top-level transcription.language
+    send_progress: bool = True  # 将 agent 的文本进度流式发送到频道
+    send_tool_hints: bool = False  # 流式发送工具调用提示（如 read_file("…")）
+    show_reasoning: bool = True  # 频道支持时展示模型推理过程
+    extract_document_text: bool = True  # 发送给模型前从文档附件中提取文本
+    send_max_retries: int = Field(default=3, ge=0, le=10)  # 最大投递尝试次数（含首次发送）
+    transcription_provider: str = "groq"  # 已弃用：改用顶层 transcription.provider
+    transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # 已弃用：改用顶层 transcription.language
 
 
 class TranscriptionConfig(Base):
-    """Cross-channel audio transcription configuration."""
+    """跨频道音频转写配置。"""
 
     enabled: bool = True
-    provider: str | None = None  # Validated by nanobot.audio.transcription_registry.
+    provider: str | None = None  # 由 nanobot.audio.transcription_registry 校验
     model: str | None = None
     language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")
     max_duration_sec: int = Field(default=120, ge=1, le=600)
@@ -114,53 +121,67 @@ class ModelPresetConfig(Base):
 
 
 class AgentDefaults(Base):
-    """Default agent configuration."""
+    """默认智能代理配置。"""
 
     workspace: str = "~/.nanobot/workspace"
-    model_preset: str | None = None  # Active preset name — takes precedence over fields below
+    # 当前生效预设名称 —— 优先级高于下方所有字段
+    model_preset: str | None = None
     model: str = "anthropic/claude-opus-4-5"
-    provider: str = (
-        "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
-    )
+    # 服务商标识（如 "anthropic"、"openrouter"）；填 "auto" 自动识别服务商
+    provider: str = "auto"
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
     context_block_limit: int | None = None
     temperature: float = 0.1
+    # 兜底备选模型列表
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
+    # 最大并行子代理数量，最小值为1
     max_concurrent_subagents: int = Field(default=1, ge=1)
     max_tool_result_chars: int = 16_000
+    # 服务商重试策略：standard 标准重试 / persistent 持久重试
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
+    # 工具提示展示的最大字符长度（示例："$ cd …/project && npm test"）
     tool_hint_max_length: int = Field(
         default=40,
         ge=20,
         le=500,
         validation_alias=AliasChoices("toolHintMaxLength"),
         serialization_alias="toolHintMaxLength",
-    )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
-    reasoning_effort: str | None = None  # low / medium / high / adaptive / none — LLM thinking effort; None preserves the provider default
-    timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
-    bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
-    bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
-    unified_session: bool = False  # Share one session across all channels (single-user multi-device)
-    disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    )
+    # 模型思考强度档位：low / medium / high / adaptive / none；设为 None 则沿用服务商默认值
+    reasoning_effort: str | None = None
+    # IANA标准时区，例如 "Asia/Shanghai"、"America/New_York"
+    timezone: str = "UTC"
+    # 命令行提示中展示的代理名称（例如 "{name} 正在思考..."）
+    bot_name: str = "nanobot"
+    # 代理名称旁展示的简短图标（emoji/文字）；填空字符串则不显示图标
+    bot_icon: str = "🐈"
+    # 是否全局共用单一会话（适用于单用户多设备场景）
+    unified_session: bool = False
+    # 禁止加载的技能名称列表（示例：["summarize", "skill-creator"]）
+    disabled_skills: list[str] = Field(default_factory=list)
+    # 会话闲置自动压缩阈值（单位：分钟，0代表关闭自动压缩）
     session_ttl_minutes: int = Field(
         default=0,
         ge=0,
         validation_alias=AliasChoices("idleCompactAfterMinutes", "sessionTtlMinutes"),
         serialization_alias="idleCompactAfterMinutes",
-    )  # Auto-compact idle threshold in minutes (0 = disabled)
+    )
+    # 会话历史可回放的最大消息条数（0代表使用默认值120，同时受token预算限制）
     max_messages: int = Field(
         default=120,
         ge=0,
-    )  # Max messages to replay from session history (0 = use default 120, respects token budget)
+    )
+    # 上下文压缩保留比例（0.5 代表压缩后保留50%的token预算）
     consolidation_ratio: float = Field(
         default=0.5,
         ge=0.1,
         le=0.95,
         validation_alias=AliasChoices("consolidationRatio"),
         serialization_alias="consolidationRatio",
-    )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
+    )
+    # 后台自省/深度思考功能配置
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 
@@ -383,7 +404,7 @@ class Config(BaseSettings):
         )
 
     def resolve_preset(self, name: str | None = None) -> ModelPresetConfig:
-        """Return effective model params from a named preset or the implicit default."""
+        """根据指定预设名称或隐式默认预设，返回生效的模型参数。"""
         name = self.agents.defaults.model_preset if name is None else name
         if not name or name == "default":
             return self.resolve_default_preset()
@@ -551,14 +572,15 @@ class Config(BaseSettings):
 
 
 def _resolve_tool_config_refs() -> None:
-    """Resolve forward references in ToolsConfig by importing tool config classes.
+    """解析工具配置中的前向引用，方式为导入各类工具配置类。
 
-    Must be called after all modules are loaded (breaks circular imports).
-    Re-exports the classes into this module's namespace so existing imports
-    like ``from nanobot.config.schema import ExecToolConfig`` continue to work.
+    必须在所有模块加载完成后调用（用于解决循环导入问题）。
+    将各类配置类重新导出至当前模块命名空间，保证原有导入语句
+    如 ``from nanobot.config.schema import ExecToolConfig`` 仍可正常使用。
     """
     import sys
 
+    # 从各个工具模块导入对应的配置模型类
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
@@ -566,7 +588,7 @@ def _resolve_tool_config_refs() -> None:
     from nanobot.agent.tools.shell import ExecToolConfig
     from nanobot.agent.tools.web import WebFetchConfig, WebSearchConfig, WebToolsConfig
 
-    # Re-export into this module's namespace
+    # 将类重新导出到当前模块的命名空间中
     mod = sys.modules[__name__]
     mod.ExecToolConfig = ExecToolConfig  # type: ignore[attr-defined]
     mod.FileToolsConfig = FileToolsConfig  # type: ignore[attr-defined]
@@ -577,6 +599,7 @@ def _resolve_tool_config_refs() -> None:
     mod.MyToolConfig = MyToolConfig  # type: ignore[attr-defined]
     mod.ImageGenerationToolConfig = ImageGenerationToolConfig  # type: ignore[attr-defined]
 
+    # 重建 Pydantic 模型，完成前向引用解析
     ToolsConfig.model_rebuild()
     Config.model_rebuild()
 

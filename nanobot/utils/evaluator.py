@@ -1,7 +1,7 @@
-"""Post-run notification evaluation for heartbeat checks.
+"""运行结果通知评估器：用于心跳检测等后台任务的结果评估。
 
-After heartbeat executes an internal check, this module makes a lightweight
-LLM call to decide whether the result warrants notifying the user.
+心跳执行完内部检查后，此模块做一次轻量级 LLM 调用，判断结果是否值得通知用户。
+避免每一条后台日志都推送给用户造成骚扰。
 """
 
 from __future__ import annotations
@@ -15,80 +15,74 @@ from nanobot.utils.prompt_templates import render_template
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
+# 评估工具定义：LLM 通过调用此函数来决定是否通知用户
 _EVALUATE_TOOL = [
     {
         "type": "function",
         "function": {
             "name": "evaluate_notification",
-            "description": "Decide whether the user should be notified about this background task result.",
+            "description": "判断是否应就后台任务结果通知用户。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "should_notify": {
                         "type": "boolean",
-                        "description": "true = result contains actionable/important info the user should see; false = routine or empty, safe to suppress",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "One-sentence reason for the decision",
+                        "description": "true = 结果包含重要的/可操作的信息，用户应该看到；false = 例行或空结果，安全忽略",
                     },
                 },
                 "required": ["should_notify"],
             },
         },
-    }
+    },
 ]
 
+
 async def evaluate_response(
-    response: str,
-    task_context: str,
     provider: LLMProvider,
     model: str,
-    default_notify: bool = True,
+    response_content: str,
+    system_prompt_extra: str = "",
 ) -> bool:
-    """Decide whether a heartbeat result should be delivered to the user.
+    """判断 LLM 的响应是否需要通知用户。
 
-    On any failure, falls back to ``default_notify``. Heartbeat passes
-    ``False`` to fail closed.
+    使用一个极简的 LLM 调用（只返回一个布尔值），判断内容是否重要到值得推送通知。
+
+    参数：
+      provider:           LLM 提供者
+      model:              模型名称
+      response_content:   需要评估的响应文本
+      system_prompt_extra: 附加的系统提示（如频道上下文）
+
+    返回：
+      True 表示应通知用户，False 表示可安全忽略
     """
+    system_prompt = render_template(
+        "agent/evaluator.md",
+        strip=True,
+        system_prompt_extra=system_prompt_extra,
+    )
     try:
-        llm_response = await provider.chat_with_retry(
+        res = await provider.chat_with_retry(
+            model=model,
             messages=[
-                {"role": "system", "content": render_template("agent/evaluator.md", part="system")},
-                {"role": "user", "content": render_template(
-                    "agent/evaluator.md",
-                    part="user",
-                    task_context=task_context,
-                    response=response,
-                )},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": response_content},
             ],
             tools=_EVALUATE_TOOL,
-            model=model,
-            max_tokens=256,
-            temperature=0.0,
+            tool_choice="required",
         )
-
-        if not llm_response.should_execute_tools:
-            if llm_response.has_tool_calls:
-                logger.warning(
-                    "evaluate_response: ignoring tool calls under finish_reason='{}', "
-                    "defaulting to notify={}",
-                    llm_response.finish_reason,
-                    default_notify,
-                )
-            else:
-                logger.warning(
-                    "evaluate_response: no tool call returned, defaulting to notify={}",
-                    default_notify,
-                )
-            return default_notify
-
-        args = llm_response.tool_calls[0].arguments
-        should_notify = args.get("should_notify", default_notify)
-        reason = args.get("reason", "")
-        logger.info("evaluate_response: should_notify={}, reason={}", should_notify, reason)
-        return bool(should_notify)
-
     except Exception:
-        logger.exception("evaluate_response failed, defaulting to notify={}", default_notify)
-        return default_notify
+        logger.exception("评估 LLM 调用失败")
+        return False
+
+    if not res.tool_calls:
+        logger.warning("评估结果中未包含工具调用")
+        return False
+
+    call = res.tool_calls[0]
+    if call.name != "evaluate_notification":
+        logger.warning("评估工具名称不匹配: {}", call.name)
+        return False
+
+    should_notify = call.arguments.get("should_notify", False)
+    return bool(should_notify)

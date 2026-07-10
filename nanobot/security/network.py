@@ -27,11 +27,24 @@ _allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
 
 def configure_ssrf_whitelist(cidrs: list[str]) -> None:
-    """Allow specific CIDR ranges to bypass SSRF blocking (e.g. Tailscale's 100.64.0.0/10)."""
+    """允许指定CIDR网段绕过SSRF拦截（例如Tailscale的100.64.0.0/10）"""
+    # SSRF Server-Side-Request Forgery 服务器端请求伪造
+    #     简单说：
+    # 攻击者操控你的后端服务器，主动去访问内网、本地、云元数据地址，窃取内部数据、探测内网服务。
+    # SSRF 拦截是后端的安全防护机制：
+    # 当服务要发起外部网络请求时，先校验目标 IP；
+    # 如果目标是内网 / 本地高危地址，直接拒绝发起请求，阻断 SSRF 攻击。
     global _allowed_networks
     nets = []
     for cidr in cidrs:
         with suppress(ValueError):
+            # 将字符串格式的CIDR网段转换为标准IP网络对象，并添加到白名单列表nets中
+            # 参数1 cidr：字符串形式的网段，例如 "100.64.0.0/10"、"192.168.1.0/24"
+            # 参数2 strict=False：宽松解析模式
+            # strict=True 严格模式要求网段主机位必须全部为0，如 "192.168.1.5/24" 会直接抛ValueError
+            # strict=False 宽松模式会自动修正网段为主机位归零的标准网络地址，不会报错
+            # ipaddress.ip_network() 执行失败时会抛出ValueError，外层with suppress(ValueError)会捕获该异常
+            # 转换成功后，得到IPv4Network/IPv6Network对象，存入nets列表，后续用于IP归属判断
             nets.append(ipaddress.ip_network(cidr, strict=False))
     _allowed_networks = nets
 

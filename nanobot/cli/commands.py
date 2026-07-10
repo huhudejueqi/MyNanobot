@@ -1,4 +1,15 @@
-"""CLI commands for nanobot."""
+"""CLI 命令模块：提供 nanobot 的终端命令行界面（基于 typer）。
+
+子命令：
+  nanobot run          启动交互式聊天
+  nanobot gateway      启动网关（连接频道）
+  nanobot provider     管理 LLM 提供者配置
+  nanobot config       管理配置文件
+  nanobot cron         管理定时任务
+  nanobot onboard      首次使用向导
+  nanobot eval         评估助手回复
+  nanobot version      查看版本
+"""
 
 import asyncio
 import os
@@ -10,20 +21,20 @@ from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
-# Force UTF-8 encoding for Windows console
+# 强制 Windows 控制台使用 UTF-8 编码，避免中文乱码
 if sys.platform == "win32":
     if sys.stdout.encoding != "utf-8":
         os.environ["PYTHONIOENCODING"] = "utf-8"
-        # Re-open stdout/stderr with UTF-8 encoding
+        # 以 UTF-8 重新打开 stdout/stderr
         with suppress(Exception):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# Keep console encoding setup before importing CLI UI/logging libraries.
+# 确保在导入 CLI UI/日志库之前完成控制台编码设置
 import typer  # noqa: E402
 from loguru import logger  # noqa: E402
 
-# Remove default handler and re-add with unified nanobot format
+# 移除默认 handler，统一用 nanobot 格式重新添加
 logger.remove()
 _log_handler_id = logger.add(
     sys.stderr,

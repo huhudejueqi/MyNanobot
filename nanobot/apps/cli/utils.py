@@ -1,4 +1,4 @@
-"""CLI Apps helpers shared by the agent loop and settings surfaces."""
+"""供智能体主循环与配置界面共用的命令行应用工具函数集。"""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ from typing import Any, Mapping
 
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Return persisted session kwargs for CLI app attachments."""
+    """从元数据中提取 CLI 应用附件的持久化会话参数。"""
     cli_apps = metadata.get("cli_apps") if isinstance(metadata, Mapping) else None
     return {"cli_apps": cli_apps} if isinstance(cli_apps, list) and cli_apps else {}
 
 
 def runtime_lines(message: Any, workspace: Path, *, skip: bool = False) -> list[str]:
-    """Return model-visible CLI app annotations for the current turn."""
+    """返回当前轮次中模型可见的 CLI 应用标注信息。"""
     if skip:
         return []
     text = message.content if isinstance(getattr(message, "content", None), str) else ""
@@ -34,12 +34,12 @@ def _cli_app_runtime_lines(
         ]
         if mentions:
             return [
-                "CLI App Attachment: "
+                "CLI App 附件: "
                 f"@{str(item['name']).strip().lower()} "
-                f"(installed; tool=run_cli_app; "
-                f"entry_point={str(item.get('entry_point') or 'unknown')}; "
-                f"skill=skills/cli-app-{str(item['name']).strip().lower()}/SKILL.md). "
-                "Read the skill when useful, then run this app with `run_cli_app`; do not bypass it with shell."
+                f"（已安装；工具=run_cli_app；"
+                f"入口点={str(item.get('entry_point') or 'unknown')}；"
+                f"技能=skills/cli-app-{str(item['name']).strip().lower()}/SKILL.md）。"
+                "如有需要请读取对应的技能文件，然后使用 `run_cli_app` 运行此应用；不要用 Shell 绕过。"
                 for item in mentions
                 if str(item.get("name") or "").strip()
             ]
@@ -52,11 +52,11 @@ def _cli_app_runtime_lines(
     except Exception:
         return []
     return [
-        "CLI App Mention: "
+        "CLI App 提及: "
         f"@{item['name']} "
-        f"(installed; tool={item['tool']}; "
-        f"entry_point={item['entry_point'] or 'unknown'}; "
-        f"skill={item['skill']}). "
-        "Read the skill when useful, then run this app with `run_cli_app`; do not bypass it with shell."
+        f"（已安装；工具={item['tool']}；"
+        f"入口点={item['entry_point'] or 'unknown'}；"
+        f"技能={item['skill']}）。"
+        "如有需要请读取对应的技能文件，然后使用 `run_cli_app` 运行此应用；不要用 Shell 绕过。"
         for item in mentions
     ]

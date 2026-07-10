@@ -1,8 +1,8 @@
-"""Neutral manifest shape for settings-managed agent apps.
+"""供配置托管型智能应用使用的标准清单规范格式。
 
-The manifest is intentionally descriptive. Installers still live in their
-own adapters, while this protocol gives the WebUI and future registries one
-small vocabulary for capabilities, trust, and verified install/remove plans.
+这份清单刻意设计为具备完整描述性。各类安装程序仍各自独立适配，
+而该通信协议为 WebUI 以及后续各类注册中心提供一套精简统一的
+规范词汇，用于描述功能权限、信任校验以及经过核验的安装/卸载流程方案。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ APP_PROTOCOL_SCHEMA = "agent-app.v1"
 
 
 def compact_dict(values: dict[str, Any]) -> dict[str, Any]:
-    """Drop empty optional values while preserving explicit booleans and zeros."""
+    """移除字典中为空的可选值，同时保留显式设置的布尔值和零值。"""
     return {
         key: value
         for key, value in values.items()
@@ -37,7 +37,7 @@ def app_manifest(
     brand_color: str | None = None,
     docs_url: str | None = None,
 ) -> dict[str, Any]:
-    """Build a stable app manifest dictionary."""
+    """构建稳定的应用清单字典。"""
     return compact_dict({
         "schema": APP_PROTOCOL_SCHEMA,
         "id": app_id,

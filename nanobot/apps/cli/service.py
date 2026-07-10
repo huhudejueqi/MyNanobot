@@ -1,4 +1,4 @@
-"""CLI-Anything catalog, install state, and safe CLI execution."""
+"""CLI-Anything 目录、安装状态与安全的 CLI 执行管理。"""
 
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ _ARTIFACT_IGNORE_DIRS = frozenset({
 
 
 class CliAppError(ValueError):
-    """User-facing CLI Apps failure."""
+    """面向用户的 CLI 应用操作失败异常。"""
 
     def __init__(self, message: str, *, status: int = 400) -> None:
         super().__init__(message)
@@ -86,12 +86,14 @@ class CliAppError(ValueError):
 
 @dataclass(slots=True)
 class CliAppsRuntimeConfig:
-    """Runtime knobs for CLI Apps."""
+    """CLI 应用的运行时配置参数。"""
 
-    install_timeout: int = 300
-    run_timeout: int = 60
-    catalog_ttl_seconds: int = 3600
+    install_timeout: int = 300       # 安装超时（秒）
+    run_timeout: int = 60            # 单次运行超时（秒）
+    catalog_ttl_seconds: int = 3600  # 目录缓存过期时间（秒）
 
+
+# ── 品牌 / Logo 映射表 ──────────────────────────────────────────────
 
 _BRANDS: dict[str, tuple[str, str]] = {
     "1password-cli": ("1password", "#3B66BC"),
@@ -197,20 +199,25 @@ _BRAND_ALIASES: dict[str, str] = {
 _BRAND_TRAILING_WORDS = ("cli", "workflow", "workflows", "app", "apps", "tool", "tools")
 
 
+# ── 工具函数 ────────────────────────────────────────────────────────
+
 def _now() -> float:
     return time.time()
 
 
 def _safe_skill_name(name: str) -> str:
+    """将应用名转为安全的 Skill 目录名。"""
     clean = _SAFE_NAME_RE.sub("-", name.lower()).strip("-")
     return f"cli-app-{clean or 'app'}"
 
 
 def _has_shell_meta(command: str) -> bool:
+    """检查命令中是否包含危险的 Shell 元字符。"""
     return any(char in command for char in _SHELL_META_CHARS)
 
 
 def _command_exists(command: str) -> bool:
+    """检查命令是否在 PATH 上可用。"""
     try:
         parts = shlex.split(command)
     except ValueError:
@@ -221,6 +228,7 @@ def _command_exists(command: str) -> bool:
 
 
 def _is_pip_install_command(command: str) -> bool:
+    """判断是否为 pip install 命令。"""
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -236,6 +244,7 @@ def _is_pip_install_command(command: str) -> bool:
 
 
 def _pip_uninstall_args_from_command(command: str) -> list[str] | None:
+    """从 pip uninstall 命令中提取包名参数。"""
     if not command or _has_shell_meta(command):
         return None
     try:
@@ -259,6 +268,7 @@ def _pip_uninstall_args_from_command(command: str) -> list[str] | None:
 
 
 def _console_script_distribution(entry_point: str) -> str | None:
+    """查找入口点对应的 pip 发行版名称。"""
     if not entry_point:
         return None
     try:
@@ -282,10 +292,12 @@ def _console_script_distribution(entry_point: str) -> str | None:
 
 
 def _brand_key(value: str) -> str:
+    """规范化品牌标识符。"""
     return _SAFE_NAME_RE.sub("-", value.lower()).replace("_", "-").strip("-")
 
 
 def _brand_candidates(app: dict[str, Any]) -> list[str]:
+    """从应用信息中提取品牌匹配候选列表。"""
     values = [
         str(app.get("name") or ""),
         str(app.get("display_name") or ""),
@@ -306,6 +318,7 @@ def _brand_candidates(app: dict[str, Any]) -> list[str]:
 
 
 def _brand_payload(app: dict[str, Any]) -> tuple[str | None, str | None]:
+    """从品牌映射表中查找应用的 Logo URL 和品牌色。"""
     declared_logo = str(app.get("logo_url") or "").strip()
     if declared_logo.startswith(("https://", "/")):
         declared_color = str(app.get("brand_color") or "").strip()
@@ -331,6 +344,7 @@ def _brand_payload(app: dict[str, Any]) -> tuple[str | None, str | None]:
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
+    """安全读取 JSON 文件，出错时返回 None。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -339,6 +353,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
+    """原子写入 JSON 文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, indent=2, ensure_ascii=False)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{int(_now() * 1_000_000)}.tmp")
@@ -351,6 +366,7 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def _safe_skill_path(value: str) -> str | None:
+    """验证并规范化 Skill 文件路径。"""
     if not value.startswith("skills/"):
         return None
     parts = value.split("/")
@@ -360,6 +376,7 @@ def _safe_skill_path(value: str) -> str | None:
 
 
 def _skill_content_url(skill_md: str, *, raw_base: str = CLI_ANYTHING_RAW_BASE) -> str | None:
+    """构建 Skill 文件内容的远端 URL。"""
     safe_path = _safe_skill_path(skill_md)
     if safe_path:
         return f"{raw_base.rstrip('/')}/{safe_path}"
@@ -374,20 +391,21 @@ def _skill_content_url(skill_md: str, *, raw_base: str = CLI_ANYTHING_RAW_BASE) 
 
 
 def _truncate(text: str, limit: int = _MAX_TOOL_OUTPUT_CHARS) -> str:
+    """截断过长的文本，保留前后文标识。"""
     if len(text) <= limit:
         return text
     omitted = len(text) - limit
-    return text[:limit] + f"\n\n... truncated {omitted} characters ..."
+    return text[:limit] + f"\n\n... 省略 {omitted} 字符 ..."
 
 
 def _catalog_description(app: dict[str, Any]) -> str:
-    """Return catalog copy without implying vendor endorsement."""
+    """返回目录描述，不包含供应商背书字眼。"""
     description = str(app.get("description") or "")
     return _ENDORSEMENT_WORD_RE.sub("", description).strip()
 
 
 class CliAppManager:
-    """Manage CLI-Anything registry entries and local install state."""
+    """管理 CLI-Anything 注册表条目与本地安装状态。"""
 
     def __init__(
         self,
@@ -416,7 +434,7 @@ class CliAppManager:
         _write_json(self.installed_path, {"schema_version": 1, "apps": installed})
 
     def installed_names(self) -> list[str]:
-        """Return registry names explicitly installed through CLI Apps."""
+        """返回通过 CLI Apps 显式安装的注册表名称列表。"""
         return sorted(str(name) for name in self._load_installed())
 
     def _fetch_registry(
@@ -426,6 +444,7 @@ class CliAppManager:
         *,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
+        """从远端注册表获取数据，并缓存至本地。"""
         cached = _read_json(cache_path)
         if (
             not force_refresh
@@ -441,7 +460,7 @@ class CliAppManager:
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
-                raise ValueError("registry response must be an object")
+                raise ValueError("注册表响应必须是对象类型")
         except Exception:
             if cached and isinstance(cached.get("data"), dict):
                 return cached["data"]
@@ -451,6 +470,7 @@ class CliAppManager:
         return data
 
     def catalog(self, *, force_refresh: bool = False) -> tuple[list[dict[str, Any]], str | None]:
+        """遍历所有注册表源，合并并返回完整目录。"""
         registries: list[tuple[str, str, dict[str, Any]]] = []
         for source, url, raw_base, required in _CATALOG_SOURCES:
             try:
@@ -498,14 +518,15 @@ class CliAppManager:
         return "nanobot-extension" if str(app.get("_source") or "") == "extensions" else "cli-anything"
 
     def get_app(self, name: str, *, force_refresh: bool = False) -> dict[str, Any]:
+        """按名称在目录中查找应用，未找到时抛出 CliAppError。"""
         wanted = name.lower()
         for app in self.catalog(force_refresh=force_refresh)[0]:
             if str(app.get("name", "")).lower() == wanted:
                 return app
-        raise CliAppError(f"CLI app '{name}' not found", status=404)
+        raise CliAppError(f"CLI 应用 '{name}' 未找到", status=404)
 
     def mentioned_installed_apps(self, text: str) -> list[dict[str, str]]:
-        """Return installed CLI Apps referenced as ``@name`` in user text."""
+        """返回用户文本中以 ``@name`` 引用且已安装的 CLI 应用列表。"""
         if "@" not in text:
             return []
         installed = self._load_installed()
@@ -536,6 +557,7 @@ class CliAppManager:
         return mentions
 
     def _strategy(self, app: dict[str, Any]) -> str:
+        """确定应用的安装策略。"""
         package_manager = str(app.get("package_manager") or "").lower()
         install_strategy = str(app.get("install_strategy") or "").lower()
         if package_manager == "bundled" or install_strategy == "bundled":
@@ -550,6 +572,7 @@ class CliAppManager:
         return "unsupported"
 
     def _install_supported(self, app: dict[str, Any]) -> bool:
+        """检查应用是否支持自动安装。"""
         if self._strategy(app) == "unsupported":
             return False
         install_cmd = str(app.get("install_cmd") or "")
@@ -563,6 +586,7 @@ class CliAppManager:
         app: dict[str, Any],
         installed: dict[str, Any],
     ) -> dict[str, Any]:
+        """构建应用的完整负载信息（含状态、Logo、清单）。"""
         name = str(app["name"])
         entry_point = str(app.get("entry_point") or "")
         install_supported = self._install_supported(app)
@@ -598,6 +622,7 @@ class CliAppManager:
         }
 
     def _package_ref(self, app: dict[str, Any]) -> dict[str, Any] | None:
+        """返回应用的包管理器引用信息。"""
         strategy = self._strategy(app)
         name = ""
         if strategy == "pip":
@@ -626,6 +651,7 @@ class CliAppManager:
         logo_url: str | None,
         brand_color: str | None,
     ) -> dict[str, Any]:
+        """构建符合 app_manifest 协议的清单负载。"""
         name = str(app["name"])
         entry_point = str(app.get("entry_point") or "")
         strategy = self._strategy(app)
@@ -675,6 +701,7 @@ class CliAppManager:
         )
 
     def payload(self, *, force_refresh: bool = False) -> dict[str, Any]:
+        """返回完整目录负载（含所有应用状态）。"""
         apps, updated = self.catalog(force_refresh=force_refresh)
         installed = self._load_installed()
         rows = [self._app_payload(app, installed) for app in apps]
@@ -686,6 +713,7 @@ class CliAppManager:
         }
 
     def installed_payload(self) -> dict[str, Any]:
+        """仅返回已安装应用的负载。"""
         installed = self._load_installed()
         rows = []
         for name, raw_entry in sorted(installed.items()):
@@ -709,6 +737,7 @@ class CliAppManager:
         }
 
     def _pip_package_from_install(self, app: dict[str, Any]) -> str | None:
+        """从 install_cmd 中提取 pip 包名。"""
         install_cmd = str(app.get("install_cmd") or "")
         try:
             tokens = shlex.split(install_cmd)
@@ -727,15 +756,16 @@ class CliAppManager:
 
     @staticmethod
     def _pip_available() -> bool:
-        """Return True if pip is importable for the current interpreter."""
+        """返回当前解释器是否可用 pip。"""
         from importlib.util import find_spec
 
         return find_spec("pip") is not None
 
     def _pip_install_argv(self, app: dict[str, Any], *, update: bool = False) -> list[str]:
+        """构造 pip 安装命令参数。"""
         install_cmd = str(app.get("install_cmd") or "")
         if not _is_pip_install_command(install_cmd) or _has_shell_meta(install_cmd):
-            raise CliAppError("unsupported pip install command")
+            raise CliAppError("不支持的 pip install 命令")
         tokens = shlex.split(install_cmd)
         args = tokens[2:] if tokens[:2] == ["pip", "install"] else tokens[4:]
         pip_available = self._pip_available()
@@ -744,7 +774,7 @@ class CliAppManager:
         elif shutil.which("uv"):
             prefix = ["uv", "pip", "install", "--python", sys.executable]
         else:
-            raise CliAppError("pip is not available and uv is not installed")
+            raise CliAppError("pip 不可用且未安装 uv")
         if update:
             if pip_available:
                 prefix.extend(["--upgrade", "--force-reinstall"])
@@ -757,12 +787,13 @@ class CliAppManager:
         app: dict[str, Any],
         installed_entry: dict[str, Any] | None = None,
     ) -> list[str]:
+        """构造 pip 卸载命令参数。"""
         if self._pip_available():
             prefix = [sys.executable, "-m", "pip", "uninstall", "-y"]
         elif shutil.which("uv"):
             prefix = ["uv", "pip", "uninstall", "--python", sys.executable]
         else:
-            raise CliAppError("pip is not available and uv is not installed")
+            raise CliAppError("pip 不可用且未安装 uv")
         distribution = str((installed_entry or {}).get("pip_distribution") or "").strip()
         if distribution:
             return [*prefix, distribution]
@@ -777,12 +808,13 @@ class CliAppManager:
         return [*prefix, package]
 
     def _npm_argv(self, app: dict[str, Any], action: str) -> list[str]:
+        """构造 npm 命令参数。"""
         npm = shutil.which("npm")
         if not npm:
-            raise CliAppError("npm is not installed")
+            raise CliAppError("npm 未安装")
         package = str(app.get("npm_package") or "")
         if not package:
-            raise CliAppError("registry entry has no npm_package")
+            raise CliAppError("注册表条目没有 npm_package")
         if action == "install":
             return [npm, "install", "-g", package]
         if action == "update":
@@ -790,6 +822,7 @@ class CliAppManager:
         return [npm, "uninstall", "-g", package]
 
     def _cleanup_stale_npm_install(self, app: dict[str, Any]) -> bool:
+        """清理 npm 安装残留。"""
         npm = shutil.which("npm")
         package = str(app.get("npm_package") or "").strip()
         if not npm or not package or "/" in package or _SAFE_NPM_DIR_RE.match(package) is None:
@@ -821,6 +854,7 @@ class CliAppManager:
         argv: list[str],
         result: subprocess.CompletedProcess[str],
     ) -> subprocess.CompletedProcess[str]:
+        """npm 安装因残留失败时自动重试。"""
         output = f"{result.stderr}\n{result.stdout}"
         if "ENOTEMPTY" not in output or "rename" not in output:
             return result
@@ -829,17 +863,18 @@ class CliAppManager:
         return self._run_argv(argv, timeout=self.runtime.install_timeout)
 
     def _split_safe_command(self, app: dict[str, Any], key: str, expected: str) -> list[str]:
+        """安全拆分 brew/uv 命令。"""
         command = str(app.get(key) or "")
         if not command:
-            raise CliAppError(f"no {key} is defined for {app['name']}")
+            raise CliAppError(f"应用 {app['name']} 未定义 {key}")
         if _has_shell_meta(command):
-            raise CliAppError("script-style install commands are disabled in this MVP")
+            raise CliAppError("此 MVP 版本不支持脚本风格的安装命令")
         try:
             argv = shlex.split(command)
         except ValueError as exc:
-            raise CliAppError(f"invalid command: {exc}") from exc
+            raise CliAppError(f"无效命令: {exc}") from exc
         if not argv or argv[0] != expected:
-            raise CliAppError(f"unsupported {expected} command")
+            raise CliAppError(f"不支持的 {expected} 命令")
         return argv
 
     def _argv_for_action(
@@ -848,6 +883,7 @@ class CliAppManager:
         action: str,
         installed_entry: dict[str, Any] | None = None,
     ) -> list[str] | None:
+        """根据策略和动作构造相应的包管理器命令参数。"""
         strategy = self._strategy(app)
         if strategy == "pip":
             if action == "install":
@@ -865,9 +901,10 @@ class CliAppManager:
             return self._split_safe_command(app, key, "uv")
         if strategy == "bundled":
             return None
-        raise CliAppError("this CLI app uses an unsupported install strategy")
+        raise CliAppError("此 CLI 应用使用不支持的安装策略")
 
     def _run_argv(self, argv: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+        """运行命令并返回结果。"""
         return subprocess.run(
             argv,
             capture_output=True,
@@ -876,6 +913,7 @@ class CliAppManager:
         )
 
     def _installed_entry(self, app: dict[str, Any]) -> dict[str, Any]:
+        """构建安装条目记录。"""
         entry_point = str(app.get("entry_point") or "")
         strategy = self._strategy(app)
         entry: dict[str, Any] = {
@@ -895,6 +933,7 @@ class CliAppManager:
         return entry
 
     def _fetch_skill_content(self, app: dict[str, Any]) -> str | None:
+        """从远端获取 Skill 文件内容。"""
         skill_md = str(app.get("skill_md") or "").strip()
         if not skill_md:
             return None
@@ -912,10 +951,11 @@ class CliAppManager:
         return text if len(text) < 250_000 else None
 
     def _fallback_skill(self, app: dict[str, Any]) -> str:
+        """生成默认 Skill 文件内容作为备选。"""
         name = str(app.get("name") or "unknown")
         display = str(app.get("display_name") or name)
         entry = str(app.get("entry_point") or f"cli-anything-{name}")
-        description = _catalog_description(app) or f"Use {display} from nanobot."
+        description = _catalog_description(app) or f"从 nanobot 使用 {display}。"
         return f"""---
 name: {_safe_skill_name(name)}
 description: >-
@@ -924,29 +964,30 @@ description: >-
 
 # {display}
 
-Use this skill when the user asks nanobot to operate {display} through its installed CLI app.
+用户要求 nanobot 通过已安装的 CLI 操作 {display} 时使用此技能。
 
-If the user attached `@{name}` in chat, treat that as the selected app for the current turn.
+如果用户在对话中附带了 `@{name}`，则将其视为本轮选中的应用。
 
-## Commands
+## 命令
 
 ```bash
 {entry} --help
 {entry} --json --help
 ```
 
-Prefer machine-readable output when the CLI supports `--json`.
+当 CLI 支持 `--json` 时优先使用机器可读输出。
 """
 
     def _with_nanobot_skill_note(self, content: str, app: dict[str, Any]) -> str:
+        """向 Skill 内容中注入 nanobot 执行说明。"""
         marker = "<!-- nanobot-cli-app-note -->"
         if marker in content:
             return content
         name = str(app.get("name") or "unknown")
         note = f"""{marker}
-## Nanobot execution
+## Nanobot 执行
 
-Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not invoke this CLI through shell unless the user explicitly asks. Prefer this skill when Runtime Context mentions `@{name}` as a CLI App Attachment.
+使用 `run_cli_app` 工具并设置 `name=\"{name}\"` 来执行命令。除非用户明确要求，否则不要通过 Shell 调用此 CLI。当运行时上下文将 `@{name}` 列为 CLI 应用附件时，优先使用本技能。
 """
         lines = content.splitlines(keepends=True)
         if lines and lines[0].strip() == "---":
@@ -956,6 +997,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         return note + "\n" + content
 
     def install_skill(self, app: dict[str, Any]) -> Path:
+        """安装应用的 Skill 文件。"""
         path = self._skill_path(str(app["name"]))
         path.parent.mkdir(parents=True, exist_ok=True)
         content = self._fetch_skill_content(app) or self._fallback_skill(app)
@@ -964,11 +1006,13 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         return path
 
     def remove_skill(self, name: str) -> None:
+        """移除应用的 Skill 文件。"""
         skill_dir = self._skill_path(name).parent
         if skill_dir.is_dir():
             shutil.rmtree(skill_dir)
 
     def _record_installed(self, app: dict[str, Any]) -> dict[str, Any]:
+        """记录安装状态并生成 Skill。"""
         installed = self._load_installed()
         entry = self._installed_entry(app)
         installed[str(app["name"])] = entry
@@ -977,9 +1021,10 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         return entry
 
     def install(self, name: str) -> dict[str, Any]:
+        """安装指定的 CLI 应用。"""
         app = self.get_app(name)
         if not self._install_supported(app):
-            raise CliAppError("this CLI app uses an unsupported install strategy")
+            raise CliAppError("此 CLI 应用使用不支持的安装策略")
         strategy = self._strategy(app)
         entry_point = str(app.get("entry_point") or "")
         if entry_point and shutil.which(entry_point):
@@ -987,7 +1032,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
             return self.payload() | {
                 "last_action": {
                     "ok": True,
-                    "message": f"CLI for {app['display_name']} is already available.",
+                    "message": f"{app['display_name']} 的 CLI 已可用。",
                     "installed": True,
                     "verification": ["entry_point_available", "state_recorded", "managed_paths_present"],
                 }
@@ -999,12 +1044,12 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
                 return self.payload() | {
                     "last_action": {
                         "ok": True,
-                        "message": f"CLI for {app['display_name']} is available.",
+                        "message": f"{app['display_name']} 的 CLI 已可用。",
                         "installed": True,
                         "verification": ["entry_point_available", "state_recorded"],
                     }
                 }
-            note = app.get("install_notes") or f"{app['display_name']} is bundled with its parent app."
+            note = app.get("install_notes") or f"{app['display_name']} 随父应用同捆发布。"
             raise CliAppError(str(note))
         argv = self._argv_for_action(app, "install")
         assert argv is not None
@@ -1012,27 +1057,28 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         if strategy == "npm" and result.returncode != 0:
             result = self._retry_stale_npm_install(app, argv, result)
         if result.returncode != 0:
-            raise CliAppError(_truncate(result.stderr or result.stdout or "install failed"), status=500)
+            raise CliAppError(_truncate(result.stderr or result.stdout or "安装失败"), status=500)
         self._record_installed(app)
         return self.payload() | {
             "last_action": {
                 "ok": True,
-                "message": f"Installed CLI for {app['display_name']}.",
+                "message": f"已安装 {app['display_name']} 的 CLI。",
                 "installed": True,
                 "verification": ["package_manager_ok", "state_recorded", "managed_paths_present"],
             }
         }
 
     def update(self, name: str) -> dict[str, Any]:
+        """更新指定的 CLI 应用。"""
         app = self.get_app(name, force_refresh=True)
         if str(app["name"]) not in self._load_installed():
-            raise CliAppError("CLI app is not installed")
+            raise CliAppError("CLI 应用未安装")
         if self._strategy(app) == "bundled":
             self._record_installed(app)
             return self.payload() | {
                 "last_action": {
                     "ok": True,
-                    "message": f"Checked {app['display_name']}.",
+                    "message": f"已检查 {app['display_name']}。",
                     "installed": True,
                     "verification": ["state_recorded"],
                 }
@@ -1041,22 +1087,23 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         assert argv is not None
         result = self._run_argv(argv, timeout=self.runtime.install_timeout)
         if result.returncode != 0:
-            raise CliAppError(_truncate(result.stderr or result.stdout or "update failed"), status=500)
+            raise CliAppError(_truncate(result.stderr or result.stdout or "更新失败"), status=500)
         self._record_installed(app)
         return self.payload() | {
             "last_action": {
                 "ok": True,
-                "message": f"Updated CLI for {app['display_name']}.",
+                "message": f"已更新 {app['display_name']} 的 CLI。",
                 "installed": True,
                 "verification": ["package_manager_ok", "state_recorded", "managed_paths_present"],
             }
         }
 
     def uninstall(self, name: str) -> dict[str, Any]:
+        """卸载指定的 CLI 应用。"""
         app = self.get_app(name)
         installed = self._load_installed()
         if str(app["name"]) not in installed:
-            raise CliAppError("CLI app is not installed")
+            raise CliAppError("CLI 应用未安装")
         raw_installed_entry = installed.get(str(app["name"]))
         installed_entry = raw_installed_entry if isinstance(raw_installed_entry, dict) else {}
         strategy = self._strategy(app)
@@ -1067,18 +1114,18 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
             assert argv is not None
             result = self._run_argv(argv, timeout=self.runtime.install_timeout)
             if result.returncode != 0:
-                raise CliAppError(_truncate(result.stderr or result.stdout or "uninstall failed"), status=500)
+                raise CliAppError(_truncate(result.stderr or result.stdout or "卸载失败"), status=500)
             still_managed = bool(managed_entry_path and Path(managed_entry_path).exists())
             still_available = bool(entry_point and shutil.which(entry_point))
             if still_managed or (not managed_entry_path and still_available):
                 reason = (
-                    f"the recorded entry point at {managed_entry_path} still exists"
+                    f"记录的入口点 {managed_entry_path} 仍然存在"
                     if still_managed
-                    else f"{entry_point} is still available on PATH"
+                    else f"{entry_point} 仍在 PATH 上可用"
                 )
                 message = (
-                    f"Uninstall for {app['display_name']} completed, but {reason}, "
-                    "so nanobot kept it installed."
+                    f"{app['display_name']} 卸载已完成，但 {reason}，"
+                    "因此 nanobot 保留了安装记录。"
                 )
                 return self.payload() | {
                     "last_action": {
@@ -1096,16 +1143,16 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         self.remove_skill(str(app["name"]))
         if strategy == "bundled" and still_available:
             message = (
-                f"Removed {app['display_name']} from nanobot. {entry_point} "
-                "is still available because it is managed outside nanobot."
+                f"已将 {app['display_name']} 从 nanobot 中移除。{entry_point} "
+                "仍可用，因为它由外部管理。"
             )
         elif still_available:
             message = (
-                f"Uninstalled CLI for {app['display_name']}, but another {entry_point} "
-                "is still available on PATH."
+                f"已卸载 {app['display_name']} 的 CLI，但另有 {entry_point} "
+                "仍在 PATH 上可用。"
             )
         else:
-            message = f"Uninstalled CLI for {app['display_name']}."
+            message = f"已卸载 {app['display_name']} 的 CLI。"
         return self.payload() | {
             "last_action": {
                 "ok": True,
@@ -1119,18 +1166,19 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         }
 
     def test(self, name: str) -> dict[str, Any]:
+        """测试 CLI 应用是否可用（运行 --help）。"""
         app = self.get_app(name)
         entry = str(app.get("entry_point") or "")
         resolved = shutil.which(entry)
         if not entry or not resolved:
-            raise CliAppError(f"{entry or name} is not available on PATH")
+            raise CliAppError(f"{entry or name} 不在 PATH 上")
         result = self._run_argv([resolved, "--help"], timeout=min(self.runtime.run_timeout, 30))
         ok = result.returncode == 0
         output = _truncate((result.stdout or result.stderr or "").strip(), 3000)
         return self.payload() | {
             "last_action": {
                 "ok": ok,
-                "message": f"{entry} --help exited {result.returncode}",
+                "message": f"{entry} --help 退出码 {result.returncode}",
                 "output": output,
             }
         }
@@ -1141,14 +1189,16 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         *,
         restrict_to_workspace: bool,
     ) -> Path:
+        """解析工作目录，可选择强制限制在工作区内。"""
         cwd = Path(working_dir).expanduser() if working_dir else self.workspace
         cwd = cwd.resolve(strict=False)
         workspace = self.workspace.resolve(strict=False)
         if restrict_to_workspace and not is_path_within(cwd, workspace):
-            raise CliAppError("working_dir is outside the configured workspace")
+            raise CliAppError("工作目录超出了配置的工作区范围")
         return cwd
 
     def _iter_artifact_candidates(self, cwd: Path) -> list[Path]:
+        """遍历工作目录，收集所有可追踪的产物文件。"""
         if not cwd.is_dir():
             return []
         out: list[Path] = []
@@ -1176,6 +1226,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         return out
 
     def _artifact_snapshot(self, cwd: Path) -> dict[Path, tuple[int, int]]:
+        """对当前工作目录的产物文件做快照（mtime + 大小）。"""
         snapshot: dict[Path, tuple[int, int]] = {}
         for path in self._iter_artifact_candidates(cwd):
             try:
@@ -1190,6 +1241,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         cwd: Path,
         before: dict[Path, tuple[int, int]],
     ) -> list[Path]:
+        """对比快照，返回发生变化的产物文件列表。"""
         changed: list[tuple[int, Path]] = []
         for path, stamp in self._artifact_snapshot(cwd).items():
             if before.get(path) == stamp:
@@ -1199,6 +1251,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         return [path for _, path in changed[-_MAX_ARTIFACT_REPORT:]]
 
     def _format_artifact_path(self, cwd: Path, path: Path) -> str:
+        """格式化产物路径为相对于工作目录的显示路径。"""
         try:
             return path.relative_to(cwd).as_posix()
         except ValueError:
@@ -1206,10 +1259,11 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
 
     @staticmethod
     def _format_artifact_size(path: Path) -> str:
+        """格式化文件大小为人类可读字符串。"""
         try:
             size = path.stat().st_size
         except OSError:
-            return "unknown size"
+            return "未知大小"
         if size < 1024:
             return f"{size} B"
         if size < 1024 * 1024:
@@ -1217,16 +1271,17 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         return f"{size / (1024 * 1024):.1f} MB"
 
     def _format_artifact_lines(self, cwd: Path, paths: list[Path]) -> list[str]:
+        """格式化产物列表为可读文本行。"""
         lines: list[str] = []
         for path in paths:
             rel = self._format_artifact_path(cwd, path)
             ext = path.suffix.lower()
             kind = (
-                "previewable image"
+                "可预览图片"
                 if ext in _INLINE_ARTIFACT_EXTENSIONS
-                else ext.lstrip(".") or "file"
+                else ext.lstrip(".") or "文件"
             )
-            lines.append(f"- {rel} ({kind}, {self._format_artifact_size(path)})")
+            lines.append(f"- {rel}（{kind}，{self._format_artifact_size(path)}）")
         return lines
 
     def run(
@@ -1239,15 +1294,16 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         timeout: int | None = None,
         restrict_to_workspace: bool = False,
     ) -> str:
+        """运行已安装的 CLI 应用并返回输出。"""
         app = self.get_app(name)
         installed = self._load_installed()
         if str(app["name"]) not in installed:
-            raise CliAppError(f"CLI app '{name}' is not installed")
+            raise CliAppError(f"CLI 应用 '{name}' 未安装")
         cwd = self._resolve_cwd(working_dir, restrict_to_workspace=restrict_to_workspace)
         entry = str(installed[str(app["name"])].get("entry_point") or app.get("entry_point") or "")
         resolved = shutil.which(entry)
         if not entry or not resolved:
-            raise CliAppError(f"{entry or name} is not available on PATH")
+            raise CliAppError(f"{entry or name} 不在 PATH 上")
         clean_args = [str(arg) for arg in (args or [])]
         if json_output and "--json" not in clean_args:
             clean_args = ["--json", *clean_args]
@@ -1263,24 +1319,24 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
                 env=os.environ.copy(),
             )
         except subprocess.TimeoutExpired:
-            return f"CLI app '{name}' timed out after {effective_timeout}s"
+            return f"CLI 应用 '{name}' 执行超时（{effective_timeout}s）"
         output = [
-            f"CLI app '{name}' exited {result.returncode}.",
-            f"Command: {entry} {' '.join(shlex.quote(arg) for arg in clean_args)}".rstrip(),
+            f"CLI 应用 '{name}' 退出码 {result.returncode}。",
+            f"命令: {entry} {' '.join(shlex.quote(arg) for arg in clean_args)}".rstrip(),
         ]
         if result.stdout:
-            output.append("\nSTDOUT:\n" + result.stdout.rstrip())
+            output.append("\n标准输出:\n" + result.stdout.rstrip())
         if result.stderr:
-            output.append("\nSTDERR:\n" + result.stderr.rstrip())
+            output.append("\n错误输出:\n" + result.stderr.rstrip())
         artifacts = self._changed_artifacts(cwd, artifact_snapshot)
         if artifacts:
             output.append(
-                "\nArtifacts created or updated:\n"
+                "\n创建或更新的产物:\n"
                 + "\n".join(self._format_artifact_lines(cwd, artifacts))
             )
             if any(path.suffix.lower() in _INLINE_ARTIFACT_EXTENSIONS for path in artifacts):
                 output.append(
-                    "\nTo show a preview in WebUI, reference a raster artifact with Markdown "
-                    "using its workspace-relative path, for example `![diagram](diagram.png)`."
+                    "\n如需在 WebUI 中预览，请使用 Markdown 引用工作区相对路径的图片，"
+                    "例如 `![diagram](diagram.png)`。"
                 )
         return _truncate("\n".join(output))

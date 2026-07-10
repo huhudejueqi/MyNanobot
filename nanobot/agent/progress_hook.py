@@ -1,4 +1,4 @@
-"""Agent hook that adapts runner events into channel progress UI."""
+"""Agent 钩子：将 runner 生命周期事件转换为用户可见的进度 UI 信号。"""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from nanobot.utils.tool_hints import format_tool_hints
 
 
 class AgentProgressHook(AgentHook):
-    """Translate runner lifecycle events into user-visible progress signals."""
+    """将 runner 生命周期事件转换为用户可见的进度信号。"""
 
     def __init__(
         self,
@@ -85,8 +85,8 @@ class AgentProgressHook(AgentHook):
             context.streamed_reasoning = True
 
         if incremental:
-            # Answer text has started; close the reasoning segment so the UI can
-            # lock the bubble before the answer renders below it.
+            # 回答文本已开始，关闭推理段以便 UI 在答案渲染前锁定气泡。
+            # 
             await self.emit_reasoning_end()
             if self._on_stream:
                 await self._on_stream(incremental)
@@ -134,7 +134,7 @@ class AgentProgressHook(AgentHook):
             )
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
-        """Publish a reasoning chunk; channel plugins decide whether to render."""
+        """发布推理文本块；频道插件自行决定是否渲染到 UI。"""
         if (
             self._on_progress
             and reasoning_content
@@ -144,7 +144,7 @@ class AgentProgressHook(AgentHook):
             await self._on_progress(reasoning_content, reasoning=True)
 
     async def emit_reasoning_end(self) -> None:
-        """Close the current reasoning stream segment, if any was open."""
+        """关闭当前推理流片段（如果有打开的话）。"""
         if self._reasoning_open and self._on_progress:
             self._reasoning_open = False
             await self._on_progress("", reasoning_end=True)

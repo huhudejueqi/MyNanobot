@@ -1,34 +1,28 @@
-"""Cron types."""
-
+"""Cron 定时任务类型定义：计划、负载、运行记录、任务状态。"""
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
 @dataclass
 class CronSchedule:
-    """Schedule definition for a cron job."""
+    """定时任务的调度定义。"""
     kind: Literal["at", "every", "cron"]
-    # For "at": timestamp in ms
-    at_ms: int | None = None
-    # For "every": interval in ms
-    every_ms: int | None = None
-    # For "cron": cron expression (e.g. "0 9 * * *")
-    expr: str | None = None
-    # Timezone for cron expressions
-    tz: str | None = None
+    at_ms: int | None = None        # "at" 类型：时间戳（毫秒）
+    every_ms: int | None = None     # "every" 类型：间隔（毫秒）
+    expr: str | None = None         # "cron" 类型：cron 表达式，如 "0 9 * * *"
+    tz: str | None = None            # 时区
 
 
 @dataclass
 class CronPayload:
-    """What to do when the job runs."""
+    """任务触发时要执行的内容。"""
     kind: Literal["system_event", "agent_turn"] = "agent_turn"
     message: str = ""
-    # Legacy delivery fields used by pre-session-bound cron jobs.
-    deliver: bool = False
-    channel: str | None = None  # e.g. "whatsapp"
-    to: str | None = None  # e.g. phone number
+    deliver: bool = False             # 是否投递到频道
+    channel: str | None = None        # 目标频道
+    to: str | None = None             # 目标接收者
     channel_meta: dict[str, Any] = field(default_factory=dict)
-    session_key: str | None = None  # original session key for correct session recording
+    session_key: str | None = None    # 原始会话 key
     origin_channel: str | None = None
     origin_chat_id: str | None = None
     origin_metadata: dict[str, Any] = field(default_factory=dict)
@@ -36,7 +30,7 @@ class CronPayload:
 
 @dataclass
 class CronRunRecord:
-    """A single execution record for a cron job."""
+    """单次任务执行记录。"""
     run_at_ms: int
     status: Literal["ok", "error", "skipped"]
     duration_ms: int = 0
@@ -45,7 +39,7 @@ class CronRunRecord:
 
 @dataclass
 class CronJobState:
-    """Runtime state of a job."""
+    """任务的运行时状态。"""
     next_run_at_ms: int | None = None
     last_run_at_ms: int | None = None
     last_status: Literal["ok", "error", "skipped"] | None = None
@@ -55,7 +49,7 @@ class CronJobState:
 
 @dataclass
 class CronJob:
-    """A scheduled job."""
+    """一个完整的定时任务定义。"""
     id: str
     name: str
     enabled: bool = True
@@ -68,6 +62,7 @@ class CronJob:
 
     @classmethod
     def from_dict(cls, kwargs: dict):
+        """从字典反序列化 CronJob（递归处理嵌套 dataclass）。"""
         state_kwargs = dict(kwargs.get("state", {}))
         state_kwargs["run_history"] = [
             record if isinstance(record, CronRunRecord) else CronRunRecord(**record)
@@ -81,6 +76,6 @@ class CronJob:
 
 @dataclass
 class CronStore:
-    """Persistent store for cron jobs."""
+    """定时任务的持久化存储。"""
     version: int = 1
     jobs: list[CronJob] = field(default_factory=list)

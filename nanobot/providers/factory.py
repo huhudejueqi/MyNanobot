@@ -1,23 +1,45 @@
-"""Create LLM providers from config."""
+"""LLM Provider 工厂与快照。
+
+负责根据配置创建 Provider 实例，并提供不可变的 ProviderSnapshot。
+快照（Snapshot）模式是参考项目中的关键设计：
+将 provider、model、context_window 等信息打包成不可变对象，
+方便在运行时安全切换模型配置而不会影响正在进行的请求。
+
+典型用法：
+    snapshot = build_provider_snapshot(config)
+    # snapshot 后续可传递给 AgentLoop.apply_snapshot()
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from nanobot.config.schema import Config, InlineFallbackConfig, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.fallback_provider import FallbackProvider
 from nanobot.providers.registry import create_dynamic_spec, find_by_name
 
-
 @dataclass(frozen=True)
 class ProviderSnapshot:
-    provider: LLMProvider
-    model: str
-    context_window_tokens: int
-    signature: tuple[object, ...]
+    """Provider 快照：不可变的数据传输对象。
 
+    将 provider、model 等信息冻结在一个对象中，
+    确保运行时切换配置时不会出现中间状态不一致的问题。
+    参考项目中 AgentLoop 使用此快照来管理模型切换。
+
+    Attributes:
+        provider: 已实例化的 LLM provider
+        model: 使用的模型名称
+        context_window_tokens: 模型上下文窗口大小
+        signature: 配置签名，用于判断配置是否发生变化
+    """
+
+    provider: LLMProvider  # 已初始化的 LLM provider 实例
+    model: str  # 模型名称，如 deepseek-v4-flash
+    context_window_tokens: int  # 上下文窗口大小
+    signature: tuple[object, ...]  # 配置签名元组，用于检测变更
 
 def _resolve_model_preset(
     config: Config,
@@ -25,17 +47,44 @@ def _resolve_model_preset(
     preset_name: str | None = None,
     preset: ModelPresetConfig | None = None,
 ) -> ModelPresetConfig:
+    """
+    解析模型预设配置（二选一逻辑）
+    优先级：直接传入的 preset 对象 > 通过名称从 config 加载预设
+    """
     return preset if preset is not None else config.resolve_preset(preset_name)
 
-
 def _make_provider_core(
-    config: Config,
+    config:Config,
     *,
     preset_name: str | None = None,
     preset: ModelPresetConfig | None = None,
-    model: str | None = None,
+    model: str|None = None,
 ) -> LLMProvider:
-    """Create a plain LLM provider without failover wrapping."""
+    """Create a plain LLM provider without failover wrapping.
+
+    Resolve preset ──► detect backend ──► validate creds ──► instantiate
+                                                                                    ┌──────────────┐
+                                          ┌──── openai_codex ──────────────────►│OpenAICodex   │
+                                          │                                    └──────────────┘
+                                          ├──── azure_openai ──────────────────►┌──────────────┐
+                                          │                                    │AzureOpenAI   │
+                                          │                                    └──────────────┘
+                                          ├──── github_copilot ─────────────────►┌──────────────┐
+                                          │                                    │GitHubCopilot │
+        config.resolve_preset() ──► backend detect ──┼──── anthropic ────────────────────►┌──────────────┐
+        config.get_provider_name()                   │                                    │Anthropic     │
+        config.get_provider()                        │                                    └──────────────┘
+        registry.find_by_name()                      ├──── bedrock ──────────────────────►┌──────────────┐
+                                                    │                                    │Bedrock       │
+                                                    │                                    └──────────────┘
+                                                    └──── openai_compat (else) ──────────►┌────────────────┐
+                                                                                         │OpenAICompat    │
+                                                                                         └────────────────┘
+
+    Before instantiation, validates api_key / api_base for the detected backend.
+    After instantiation, attaches generation settings (temperature, max_tokens, etc.)
+    from the resolved preset.
+    """
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
     model = model or resolved.model
     provider_name = config.get_provider_name(model, preset=resolved)
@@ -119,72 +168,18 @@ def _make_provider_core(
     provider.generation = resolved.to_generation_settings()
     return provider
 
-
-def _inline_fallback_preset(
-    primary: ModelPresetConfig,
-    fallback: InlineFallbackConfig,
-) -> ModelPresetConfig:
-    return ModelPresetConfig(
-        model=fallback.model,
-        provider=fallback.provider,
-        max_tokens=fallback.max_tokens if fallback.max_tokens is not None else primary.max_tokens,
-        context_window_tokens=(
-            fallback.context_window_tokens
-            if fallback.context_window_tokens is not None
-            else primary.context_window_tokens
-        ),
-        temperature=(
-            fallback.temperature if fallback.temperature is not None else primary.temperature
-        ),
-        reasoning_effort=fallback.reasoning_effort,
-    )
-
-
-def _resolve_fallback_presets(config: Config, primary: ModelPresetConfig) -> list[ModelPresetConfig]:
-    presets: list[ModelPresetConfig] = []
-    for fallback in config.agents.defaults.fallback_models:
-        if isinstance(fallback, str):
-            presets.append(config.model_presets[fallback])
-        else:
-            presets.append(_inline_fallback_preset(primary, fallback))
-    return presets
-
-
-def make_provider(
-    config: Config,
-    *,
-    preset_name: str | None = None,
-    preset: ModelPresetConfig | None = None,
-    model: str | None = None,
-) -> LLMProvider:
-    """Create the LLM provider implied by config.
-
-    When *model* is given, it overrides the resolved/preset model — used by
-    the failover path to create providers for fallback models.
-    """
-    resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
-    provider = _make_provider_core(config, preset_name=preset_name, preset=preset, model=model)
-    fallback_presets = _resolve_fallback_presets(config, resolved)
-
-    if fallback_presets:
-        provider = FallbackProvider(
-            primary=provider,
-            fallback_presets=fallback_presets,
-            provider_factory=lambda fb: _make_provider_core(
-                config, preset_name=preset_name, preset=fb
-            ),
-        )
-
-    return provider
-
-
 def provider_signature(
     config: Config,
     *,
     preset_name: str | None = None,
     preset: ModelPresetConfig | None = None,
 ) -> tuple[object, ...]:
-    """Return the config fields that affect the active provider chain."""
+    """从 Config 中提取影响 provider 行为的字段签名。
+
+    签名用于判断 provider 配置是否发生了变化。
+    如果签名不变，可以复用已有的 provider 实例。
+    参考项目中 AgentLoop 用此签名来做热切换检测。
+    """
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
     p = config.get_provider(resolved.model, preset=resolved)
     fallback_presets = _resolve_fallback_presets(config, resolved)
@@ -229,17 +224,61 @@ def provider_signature(
     )
 
 
+
+# def _make_provider(config: Config) -> LLMProvider:
+#     """根据 Config 创建 LLM provider 实例。
+
+#     根据 config 中配置的服务商名称选择对应的 provider 实现。
+#     目前支持 deepseek 和通用 OpenAI 兼容格式。
+#     后续可在此扩展对 Anthropic、Google 等 provider 的支持。
+#     """
+#     name, pcfg = config.get_active_provider()
+#     api_key = pcfg.api_key  # 用户 API 密钥
+#     api_base = pcfg.api_base  # API 基础地址
+
+#     if name == "deepseek":
+#         # DeepSeek 使用 OpenAI 兼容协议，走同一个 provider
+#         from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+
+#         return OpenAICompatProvider(
+#             api_key=api_key,
+#             api_base=api_base or "https://api.deepseek.com",
+#         )
+
+#     # 默认走 OpenAI 兼容（支持 OpenAI、DeepSeek、vLLM、Ollama 等）
+#     from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+
+#     return OpenAICompatProvider(
+#         api_key=api_key,
+#         api_base=api_base or "https://api.openai.com/v1",
+#     )
+
+
 def build_provider_snapshot(
     config: Config,
     *,
-    preset_name: str | None = None,
-    preset: ModelPresetConfig | None = None,
+    preset_name:str|None=None,
+    preset:ModelPresetConfig|None = None
+                            
 ) -> ProviderSnapshot:
+    """从 Config 构建 ProviderSnapshot。
+
+    这是从配置到快照的标准转换流程：
+    Config → Provider 实例 → ProviderSnapshot
+
+    Args:
+        config: 已加载的配置对象
+
+    Returns:
+        包含已初始化 provider 的不可变快照
+    """
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
+    # provider = _make_provider(config)
+    # model = config.agents.defaults.model
     fallback_windows = [
-        fallback.context_window_tokens
-        for fallback in _resolve_fallback_presets(config, resolved)
-    ]
+            fallback.context_window_tokens
+            for fallback in _resolve_fallback_presets(config, resolved)
+        ]
     return ProviderSnapshot(
         provider=make_provider(config, preset=resolved),
         model=resolved.model,
@@ -248,14 +287,74 @@ def build_provider_snapshot(
     )
 
 
-def load_provider_snapshot(
-    config_path: Path | None = None,
-    *,
-    preset_name: str | None = None,
-) -> ProviderSnapshot:
-    from nanobot.config.loader import load_config, resolve_config_env_vars
+def load_provider_snapshot(config_path: Path | None = None) -> ProviderSnapshot:
+    """从 ~/.nanobot/config.json 加载 ProviderSnapshot。
 
-    return build_provider_snapshot(
-        resolve_config_env_vars(load_config(config_path)),
-        preset_name=preset_name,
+    便捷方法，适用于快速启动场景。
+    内部调用 load_config() 再调用 build_provider_snapshot()。
+
+    Args:
+        config_path: 可选的配置文件路径，不传则走默认路径
+
+    Returns:
+        包含已初始化 provider 的不可变快照
+    """
+    config = load_config(config_path)
+    return build_provider_snapshot(config)
+
+def _inline_fallback_preset(
+    primary: ModelPresetConfig,
+    fallback: InlineFallbackConfig,
+) -> ModelPresetConfig:
+    return ModelPresetConfig(
+        model=fallback.model,
+        provider=fallback.provider,
+        max_tokens=fallback.max_tokens if fallback.max_tokens is not None else primary.max_tokens,
+        context_window_tokens=(
+            fallback.context_window_tokens
+            if fallback.context_window_tokens is not None
+            else primary.context_window_tokens
+        ),
+        temperature=(
+            fallback.temperature if fallback.temperature is not None else primary.temperature
+        ),
+        reasoning_effort=fallback.reasoning_effort,
     )
+
+def _resolve_fallback_presets(config: Config, primary: ModelPresetConfig) -> list[ModelPresetConfig]:
+    presets: list[ModelPresetConfig] = []
+    for fallback in config.agents.defaults.fallback_models:
+        if isinstance(fallback, str):
+            presets.append(config.model_presets[fallback])
+        else:
+            presets.append(_inline_fallback_preset(primary, fallback))
+    return presets
+
+
+def make_provider(
+    config:Config,
+    *,
+    preset_name: str|None = None,
+    preset: ModelPresetConfig| None = None,
+    model: str | None = None,
+) -> LLMProvider:
+    """
+    根据配置创建对应的大模型服务提供者。
+
+    若传入了 model 参数，该值会覆盖从预设解析得到的模型名称——该逻辑用于故障降级流程，
+    为兜底备选模型创建对应的服务提供者实例。
+    """
+    resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
+    provider = _make_provider_core(config, preset_name=preset_name, preset=preset, model=model)
+    fallback_presets = _resolve_fallback_presets(config, resolved)
+
+    if fallback_presets:
+        provider = FallbackProvider(
+            primary=provider,
+            fallback_presets=fallback_presets,
+            provider_factory=lambda fb: _make_provider_core(
+                config, preset_name=preset_name, preset=fb
+            ),
+        )
+
+    return provider

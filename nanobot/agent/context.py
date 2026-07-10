@@ -1,4 +1,11 @@
-"""Context builder for assembling agent prompts."""
+"""上下文构建器：组装历史消息、技能提示等上下文信息。
+
+典型用法：
+  >>> builder = ContextBuilder(workspace_path)
+  >>> system_prompt = builder.build_system_prompt(skill_names=["weather", "cron"])
+  >>> print(system_prompt)
+  # 输出组装好的完整系统提示，包含身份、记忆和技能说明
+"""
 
 import base64
 import mimetypes
@@ -23,12 +30,48 @@ from nanobot.utils.prompt_templates import render_template
 
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Return persisted kwargs for turn-attached capabilities."""
+    """返回当前轮次附带的持久化能力参数（CLI 应用 + MCP 服务器的合并结果）。
+
+    从会话元数据中提取 CLI 应用和 MCP 服务器的持久化配置，
+    合并为一个字典返回，供后续消息处理链路使用。
+
+    参数：
+      metadata: 会话元数据字典，可能包含 cli_apps、mcp_presets 等字段
+
+    返回：
+      合并后的能力参数字典
+
+    示例：
+      >>> meta = {"cli_apps": [{"name": "gh"}], "mcp_presets": [{"name": "weather"}]}
+      >>> extra = session_extra(meta)
+      >>> extra  # 返回 cli 和 mcp 两部分的合并结果
+      {'cli_apps': [...], 'mcp_presets': [...]}
+    """
     return cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
 
 
 def runtime_lines(state: Any, msg: Any, workspace: Path, *, skip: bool = False) -> list[str]:
-    """Return model-visible runtime annotations for turn-attached capabilities."""
+    """返回当前轮次附带的运行时标注行（CLI 应用 + MCP 服务器状态），这些行会展示给 LLM 可见。
+
+    收集当前可用的 CLI 应用列表和已连接/已配置的 MCP 服务器信息，
+    返回字符串列表，每行是一个标注，最终拼接到 LLM 的上下文中。
+
+    参数：
+      state:     Agent 运行时状态，包含 _mcp_servers / _mcp_stacks 等字段
+      msg:       当前输入消息对象
+      workspace: 工作区目录路径
+      skip:      True 时跳过某些耗时检查（如 CLI 应用可用性检测）
+
+    返回：
+      标注行列表，每行是一个描述性字符串
+
+    示例：
+      >>> lines = runtime_lines(state, msg, workspace)
+      >>> for line in lines:
+      ...     print(line)
+      [CLI App] gh (GitHub CLI)
+      [MCP] weather (connected)
+    """
     return [
         *cli_app_utils.runtime_lines(msg, workspace, skip=skip),
         *mcp_tools.runtime_lines(
@@ -49,40 +92,78 @@ async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolReg
 
 
 class ContextBuilder:
-    """Builds the context (system prompt + messages) for the agent."""
+    """上下文构建器：负责组装发给 LLM 的系统提示（身份、记忆、技能、摘要等）。
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
+    这是 Agent 的核心组件之一，负责收集所有上下文信息并组装成
+    发给 LLM 的系统提示（system prompt），包括：
+      - Agent 身份定义（名称、角色、平台信息）
+      - 引导文件（AGENTS.md / SOUL.md / USER.md）
+      - 工具契约说明
+      - 长期记忆（MEMORY.md）
+      - Always 技能（始终激活的技能，如 memory、my）
+      - 技能摘要列表
+      - 最近历史事件摘要
+      - 当前会话摘要（如果有）
+      - 目标状态信息（如果有活跃目标）
+
+    参数：
+      workspace:       工作区目录路径，用于定位 skills/、memory/ 等目录
+      disabled_skills: 禁用的技能名称列表，这些技能不会出现在系统提示中
+
+    示例：
+      >>> builder = ContextBuilder(workspace)
+      >>> prompt = builder.build_system_prompt(
+      ...     skill_names=["weather", "csv-tool"],
+      ...     channel="telegram",
+      ... )
+      >>> print(prompt[:200])  # 查看系统提示的前 200 个字符
+
+      >>> # 带会话摘要的构建
+      >>> prompt2 = builder.build_system_prompt(
+      ...     skill_names=["weather"],
+      ...     session_summary="用户正在查询最近一周的天气数据",
+      ... )
+    """
+    BOOTSTRAP_FILES = ["AGENTS.md","SOUL.md","USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
-    _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
+    _MAX_HISTORY_CHARS = 32_000  # 近期历史区块大小的硬性上限
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
-        self.workspace = workspace
-        self.timezone = timezone
+        """初始化上下文构建器。
+
+        参数：
+          workspace:       工作区目录路径
+          disabled_skills: 禁用的技能名称列表
+
+        示例：
+          >>> builder = ContextBuilder(Path("/home/user/.nanobot/workspace"))
+          >>> builder = ContextBuilder(workspace, disabled_skills=["tmux", "github"])
+        """
+        self.workspace = workspace,
+        self.timezone = timezone,
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
         self,
-        skill_names: list[str] | None = None,
-        channel: str | None = None,
-        session_summary: str | None = None,
-        workspace: Path | None = None,
-        include_memory_recent_history: bool = True,
+        skill_names:list[str]|None = None,
+        channel:str|None = None,
+        session_summary: str|None = None,
+        workspace:Path| None = None,
+        include_memory_recent_history:bool=True,
         session_key: str | None = None,
-        unified_session: bool = False,
-    ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        unified_session: bool = False
+    )->str:
         root = workspace or self.workspace
-        parts = [self._get_identity(channel=channel, workspace=root)]
-
-        bootstrap = self._load_bootstrap_files(root)
+        parts = [self._get_identity(channel=channel,workspace=root)]
+        
+        bootstrap = self._load_bootstrap_files(root) #三大提示词
         if bootstrap:
             parts.append(bootstrap)
-
+        
         parts.append(render_template("agent/tool_contract.md"))
-
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
             parts.append(f"# Memory\n\n{memory}")
@@ -96,12 +177,11 @@ class ContextBuilder:
         skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
-
         if include_memory_recent_history:
             entries = self.memory.read_recent_history_for_prompt(
                 since_cursor=self.memory.get_last_dream_cursor(),
-                session_key=session_key,
-                unified_session=unified_session,
+                session_key = session_key,
+                unified_session = unified_session
             )
             if entries:
                 capped = entries[-self._MAX_RECENT_HISTORY:]
@@ -110,16 +190,15 @@ class ContextBuilder:
                 )
                 history_text = truncate_text(history_text, self._MAX_HISTORY_CHARS)
                 parts.append("# Recent History\n\n" + history_text)
-
         if session_summary:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
-        """Get the core identity section."""
+
+    def _get_identity(self,channel: str | None = None, workspace: Path | None = None) -> str:
         root = workspace or self.workspace
-        workspace_path = str(root.expanduser().resolve())
+        workspace_path = str(root.expanduser().resolve()) # 标准项目转
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
@@ -130,17 +209,17 @@ class ContextBuilder:
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
         )
-
+    
     @staticmethod
     def _build_runtime_context(
-        channel: str | None,
-        chat_id: str | None,
-        timezone: str | None = None,
+        channel: str|None,
+        chat_id: str|None,
+        timezone: str|None = None,
         sender_id: str | None = None,
         supplemental_lines: Sequence[str] | None = None,
-    ) -> str:
-        """Build untrusted runtime metadata block appended after user content."""
-        lines = [f"Current Time: {current_time_str(timezone)}"]
+    )->str:
+        "构建不可信的运行时元数据块，追加在用户内容之后。"
+        lines =[f"Current Time:{current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         if sender_id:
@@ -148,6 +227,7 @@ class ContextBuilder:
         if supplemental_lines:
             lines.extend(supplemental_lines)
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
+
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -162,28 +242,29 @@ class ContextBuilder:
             return [{"type": "text", "text": str(value)}]
 
         return _to_blocks(left) + _to_blocks(right)
+    
+    def _load_bootstrap_files(self,workspace:Path|None = None):
 
-    def _load_bootstrap_files(self, workspace: Path | None = None) -> str:
-        """Load all bootstrap files from workspace."""
+        #从工作空间拿所有的
         parts = []
         root = workspace or self.workspace
-
         for filename in self.BOOTSTRAP_FILES:
-            file_path = root / filename
+            file_path = root/filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
-
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
-        """Check if *content* is identical to the bundled template (user hasn't customized it)."""
+        """判断传入内容是否与内置模板完全一致（即用户未做自定义修改）。"""
+        # 读取内置模板文件
         tpl = load_bundled_template(template_path)
         if tpl is not None:
+            # 去除首尾空白后对比内容
             return content.strip() == tpl.strip()
+        # 模板读取失败，返回False
         return False
-
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -278,3 +359,5 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
+
+    

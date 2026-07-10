@@ -1,4 +1,4 @@
-"""Shared lifecycle hook primitives for agent runs."""
+"""Agent 生命周期钩子 — 与 my-bot 保持一致。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 @dataclass(slots=True)
 class AgentHookContext:
-    """Mutable per-iteration state exposed to runner hooks."""
+    """每轮迭代的状态快照。"""
 
     iteration: int
     messages: list[dict[str, Any]]
@@ -31,7 +31,7 @@ class AgentHookContext:
 
 @dataclass(slots=True)
 class AgentRunHookContext:
-    """Run-level state snapshot exposed to runner hooks."""
+    """整个 run 结束时的状态快照。"""
 
     messages: list[dict[str, Any]]
     final_content: str | None = None
@@ -45,66 +45,78 @@ class AgentRunHookContext:
 
 
 class AgentHook:
-    """Minimal lifecycle surface for shared runner customization."""
+    """Agent 生命周期钩子基类，所有方法默认空操作。
+
+    子类覆盖需要的生命周期方法即可。
+    """
 
     def __init__(self, reraise: bool = False) -> None:
         self._reraise = reraise
 
     def wants_streaming(self) -> bool:
+        """返回 True 表示此钩子期望流式输出。"""
         return False
 
-    async def before_run(self, context: AgentRunHookContext) -> None:
+    # ── run 级别 ──
+
+    async def before_run(self, ctx: AgentRunHookContext) -> None:
         pass
 
-    async def after_run(self, context: AgentRunHookContext) -> None:
+    async def after_run(self, ctx: AgentRunHookContext) -> None:
         pass
 
-    async def on_error(self, context: AgentRunHookContext) -> None:
+    async def on_error(self, ctx: AgentRunHookContext) -> None:
         pass
 
-    async def on_finally(self, context: AgentRunHookContext) -> None:
+    async def on_finally(self, ctx: AgentRunHookContext) -> None:
         pass
 
-    async def before_iteration(self, context: AgentHookContext) -> None:
+    # ── 迭代级别 ──
+
+    async def before_iteration(self, ctx: AgentHookContext) -> None:
         pass
 
-    async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+    async def _before_iteration(self, ctx: AgentHookContext) -> None:
+        """内部调用 before_iteration，不覆盖此方法。"""
+        await self.before_iteration(ctx)
+
+    async def after_iteration(self, ctx: AgentHookContext) -> None:
         pass
 
-    async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+    async def before_execute_tools(self, ctx: AgentHookContext | None = None) -> None:
         pass
 
-    async def before_execute_tools(self, context: AgentHookContext) -> None:
+    # ── 流式 ──
+
+    async def on_stream(self, ctx: AgentHookContext, delta: str) -> None:
         pass
+
+    async def on_stream_end(self, ctx: AgentHookContext, *, resuming: bool) -> None:
+        pass
+
+    # ── 推理 ──
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         pass
 
     async def emit_reasoning_end(self) -> None:
-        """Mark the end of an in-flight reasoning stream.
-
-        Hooks that buffer ``emit_reasoning`` chunks (for in-place UI updates)
-        flush and freeze the rendered group here. One-shot hooks ignore.
-        """
         pass
 
-    async def after_iteration(self, context: AgentHookContext) -> None:
-        pass
+    # ── 内容后处理 ──
 
-    def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
+    def finalize_content(
+        self, ctx: AgentHookContext, content: str | None
+    ) -> str | None:
         return content
 
 
 class CompositeHook(AgentHook):
-    """Fan-out hook that delegates to an ordered list of hooks.
-
-    Error isolation: async methods catch and log per-hook exceptions
-    so a faulty custom hook cannot crash the agent loop.
-    ``finalize_content`` is a pipeline (no isolation — bugs should surface).
-    """
-
-    __slots__ = ("_hooks",)
-
+    """组合钩子：依次调用所有子钩子，单个异常不影响其他钩子。"""
+    # 相当于所有 hook 方法调用时，loop_hook 和每个 run_hooks 都会收到同样的调用：
+    # on_stream(delta) 被调用
+    #     ├── loop_hook.on_stream(delta)     → 推流式给前端
+    #     ├── _DebugHook.on_stream(delta)    → 打日志
+#     └── 其他自定义 hook.on_stream(delta)
     def __init__(self, hooks: list[AgentHook]) -> None:
         super().__init__()
         self._hooks = list(hooks)
@@ -123,29 +135,33 @@ class CompositeHook(AgentHook):
             except Exception:
                 logger.exception("AgentHook.{} error in {}", method_name, type(h).__name__)
 
-    async def before_iteration(self, context: AgentHookContext) -> None:
-        await self._for_each_hook_safe("before_iteration", context)
 
-    async def before_run(self, context: AgentRunHookContext) -> None:
-        await self._for_each_hook_safe("before_run", context)
+    async def before_run(self, ctx: AgentRunHookContext) -> None:
+        await self._for_each_hook_safe("before_run", ctx)
 
-    async def after_run(self, context: AgentRunHookContext) -> None:
-        await self._for_each_hook_safe("after_run", context)
+    async def after_run(self, ctx: AgentRunHookContext) -> None:
+        await self._for_each_hook_safe("after_run", ctx)
 
-    async def on_error(self, context: AgentRunHookContext) -> None:
-        await self._for_each_hook_safe("on_error", context)
+    async def on_error(self, ctx: AgentRunHookContext) -> None:
+        await self._for_each_hook_safe("on_error", ctx)
 
-    async def on_finally(self, context: AgentRunHookContext) -> None:
-        await self._for_each_hook_safe("on_finally", context)
+    async def on_finally(self, ctx: AgentRunHookContext) -> None:
+        await self._for_each_hook_safe("on_finally", ctx)
 
-    async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-        await self._for_each_hook_safe("on_stream", context, delta)
+    async def before_iteration(self, ctx: AgentHookContext) -> None:
+        await self._for_each_hook_safe("before_iteration", ctx)
 
-    async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
-        await self._for_each_hook_safe("on_stream_end", context, resuming=resuming)
+    async def after_iteration(self, ctx: AgentHookContext) -> None:
+        await self._for_each_hook_safe("after_iteration", ctx)
 
-    async def before_execute_tools(self, context: AgentHookContext) -> None:
-        await self._for_each_hook_safe("before_execute_tools", context)
+    async def before_execute_tools(self, ctx: AgentHookContext | None = None) -> None:
+        await self._for_each_hook_safe("before_execute_tools", ctx)
+
+    async def on_stream(self, ctx: AgentHookContext, delta: str) -> None:
+        await self._for_each_hook_safe("on_stream", ctx, delta)
+
+    async def on_stream_end(self, ctx: AgentHookContext, *, resuming: bool) -> None:
+        await self._for_each_hook_safe("on_stream_end", ctx, resuming=resuming)
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         await self._for_each_hook_safe("emit_reasoning", reasoning_content)
@@ -153,35 +169,22 @@ class CompositeHook(AgentHook):
     async def emit_reasoning_end(self) -> None:
         await self._for_each_hook_safe("emit_reasoning_end")
 
-    async def after_iteration(self, context: AgentHookContext) -> None:
-        await self._for_each_hook_safe("after_iteration", context)
-
-    def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
+    def finalize_content(
+        self, ctx: AgentHookContext, content: str | None
+    ) -> str | None:
         for h in self._hooks:
-            content = h.finalize_content(context, content)
+            content = h.finalize_content(ctx, content)
         return content
 
 
 class SDKCaptureHook(AgentHook):
-    """Record tool names and the final message list for ``RunResult``.
-
-    The runner mutates ``context.messages`` in place across iterations, so the
-    snapshot is refreshed on every ``after_iteration`` call; the last call
-    reflects the end-of-turn state the SDK caller cares about.  The run-level
-    snapshot is authoritative when available and covers paths without a final
-    per-iteration callback.
-    """
+    """捕获工具调用信息的钩子。"""
 
     def __init__(self) -> None:
         super().__init__()
         self.tools_used: list[str] = []
         self.messages: list[dict[str, Any]] = []
 
-    async def after_iteration(self, context: AgentHookContext) -> None:
-        for call in context.tool_calls:
-            self.tools_used.append(call.name)
-        self.messages = list(context.messages)
-
-    async def after_run(self, context: AgentRunHookContext) -> None:
-        self.tools_used = list(context.tools_used)
-        self.messages = list(context.messages)
+    async def after_run(self, ctx: AgentRunHookContext) -> None:
+        self.tools_used = list(ctx.tools_used)
+        self.messages = list(ctx.messages)
