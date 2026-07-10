@@ -141,8 +141,8 @@ class ContextBuilder:
           >>> builder = ContextBuilder(Path("/home/user/.nanobot/workspace"))
           >>> builder = ContextBuilder(workspace, disabled_skills=["tmux", "github"])
         """
-        self.workspace = workspace,
-        self.timezone = timezone,
+        self.workspace = workspace
+        self.timezone = timezone
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 

@@ -137,6 +137,16 @@ class TurnContext:
 
     error: str | None = None
 
+    # def __repr__(self) -> str:
+    #     lines = [f"TurnContext(session_key={self.session_key}, state={self.state.name}, turn_id={self.turn_id})"]
+    #     lines.append(f"  final_content: {(self.final_content[:120] + '...') if self.final_content and len(self.final_content) > 120 else self.final_content}")
+    #     lines.append(f"  stop_reason={self.stop_reason}, tools_used={self.tools_used}, ephemeral={self.ephemeral}")
+    #     if self.trace:
+    #         lines.append("  trace:")
+    #         for t in self.trace:
+    #             lines.append(f"    {t.state.name:12s} {t.duration_ms:>8.2f}ms  {t.event}")
+    #     return "\n".join(lines)
+
 
 class _DebugHook(AgentHook):
     """调试钩子：把 hook 事件全部打印到 logger.info。"""
@@ -949,6 +959,8 @@ class AgentLoop:
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
+        logger.info("_state_save")
+        turn_continuation.prepare_save_boundary(ctx)
         if ctx.session is not None and ctx.all_messages:
             ctx.session.messages = list(ctx.all_messages)
             self.sessions.save(ctx.session)
@@ -1414,8 +1426,7 @@ class AgentLoop:
 
 
 
-    @staticmethod
-
+    # @staticmethod
     def _clear_pending_user_turn(self, session: Session) -> None:
         """清除 session 中"待处理的用户 turn"标记。"""
         session.metadata.pop(self._PENDING_USER_TURN_KEY, None)
@@ -1424,6 +1435,7 @@ class AgentLoop:
         """清除 session 中的运行时 checkpoint。"""
         if self._RUNTIME_CHECKPOINT_KEY in session.metadata:
             session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+    @staticmethod
     def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
         """生成消息的唯一标识元组，用于 checkpoint 恢复时对比消息是否已存在。"""
         return (

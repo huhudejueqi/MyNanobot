@@ -141,10 +141,10 @@ async def maybe_continue_turn(ctx: Any) -> bool:
 
 
 def prepare_save_boundary(ctx: Any) -> None:
-    """Prepare continuation bookkeeping and the history append boundary."""
+    """准备续写状态记账与历史追加分界标识"""
+    logger.debug("prepare_save_boundary {}", ctx)
     if ctx.session is not None:
         clear_internal_continuation_state(ctx.session.metadata)
-
     ctx.save_skip = _save_skip_for_turn(
         message_metadata=ctx.msg.metadata,
         initial_message_count=len(ctx.initial_messages),
@@ -169,7 +169,7 @@ def _continuation_available(
 
 
 def clear_internal_continuation_state(metadata: MutableMapping[str, Any]) -> None:
-    """Reset policy bookkeeping once its owning runtime mode is inactive."""
+    """一旦策略所属运行模式切换为非活跃状态，重置该策略的状态台账"""
     if not sustained_goal_active(metadata):
         metadata.pop(_GOAL_CONTINUATION_ROUNDS_KEY, None)
 
@@ -181,17 +181,21 @@ def _save_skip_for_turn(
     history_count: int,
     user_persisted_early: bool,
 ) -> int:
-    """Return the persisted-message append boundary for this turn."""
+    """返回本轮对话的持久化消息追加分界下标"""
+    # 如果消息元数据标记需跳过用户消息持久化
     if message_metadata and message_metadata.get(SKIP_USER_PERSIST_META) is True:
         return initial_message_count
+    # 判断是否为内部接续生成的入站消息
     if internal_continuation_inbound(message_metadata):
         return initial_message_count
-    # build_messages may merge the current message into a same-role history tail.
-    # Runner-appended messages start at initial_message_count in either shape.
+    # build_messages 可能会将当前消息合并至同角色历史消息末尾
+    # 由运行器追加的消息，无论哪种结构都从 initial_message_count 下标开始
     has_standalone_current = initial_message_count > 1 + history_count
+    # 若当前消息为独立条目，且未提前持久化用户消息
     if has_standalone_current and not user_persisted_early:
         return initial_message_count - 1
     return initial_message_count
+
 
 
 def _goal_continuation_available(

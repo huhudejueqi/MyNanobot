@@ -6,8 +6,8 @@
 
 import asyncio
 import logging, os
-import subprocess
 import sys
+import subprocess
 from pathlib import Path
 
 project_root = Path(__file__).parent
@@ -23,13 +23,17 @@ def setup_logging() -> Path:
     """配置日志：写入文件，不干扰终端。"""
     log_file = Path.home() / ".nanobot" / "agent.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(str(log_file), encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     log_level = os.environ.get("NANOBOT_LOG_LEVEL", "INFO").upper()
-    logging.getLogger("nanobot").setLevel(getattr(logging, log_level, logging.INFO))
-    logging.getLogger("nanobot").addHandler(fh)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    from loguru import logger
+    logger.remove()                          # 关掉 loguru 默认的 stderr 输出
+    logger.add(str(log_file),                # 输出到文件
+             level=log_level, format="{time:YYYY-MM-DD HH:mm:ss.SSS} [{level}][{name}] {message}",
+             encoding="utf-8", rotation="10 MB", retention=3)
+    from nanobot.utils.logging_bridge import redirect_lib_logging
+    redirect_lib_logging("nanobot", level=log_level)  # 把标准 logging 的 nanobot.* 都导入 loguru
+    logging.getLogger("nanobot").setLevel(getattr(logging, log_level, logging.INFO))  # logger 自身也要放行
+    redirect_lib_logging("httpx", level="WARNING")
+    redirect_lib_logging("httpcore", level="WARNING")
     return log_file
 
 

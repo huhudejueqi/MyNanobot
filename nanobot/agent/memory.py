@@ -238,49 +238,48 @@ class MemoryStore:
     ) -> int:
         """追加一条记录到 history.jsonl，返回自增游标值。
 
-        Entries are passed through `strip_think` to drop template-level leaks
-        (e.g. unclosed `<think` prefixes, `<channel|>` markers) before being
-        persisted. If the cleaned content is empty but the raw entry wasn't,
-        the record is persisted with an empty string rather than falling back
-        to the raw leak — otherwise `strip_think`'s guarantees would be
-        undone by history replay / consolidation downstream.
+        ┌──────────────────────────────────────────────────────────────────┐
+        │                     append_history(entry)                       │
+        │                     ──────────────                              │
+        │   输入: entry(str)                                              │
+        └──────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+        ┌──────────────────────────────────────────────────────────────────┐
+        │  ① 预处理                                                        │
+        │     raw = entry.rstrip()         ← 去尾部空白                    │
+        │     ts = datetime.now()          ← 打时间戳                      │
+        │     max_chars 防御上限             ← 超长截断                    │
+        └──────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+        ┌──────────────────────────────────────────────────────────────────┐
+        │  ② 清洗                                                          │
+        │     content = strip_think(raw)   ← 剔除模板泄露标记             │
+        │       （<think前缀、<channel|> 等）                              │
+        └──────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+        ┌──────────────────────────────────────────────────────────────────┐
+        │  ③ 原子写入 （with _append_lock）                                 │
+        │     │                                                            │
+        │     ├─ cursor = _next_cursor()   ← 自增游标                     │
+        │     ├─ 构建 record = {cursor, ts, content[, session_key]}       │
+        │     ├─ JSON 追加 → history.jsonl                                 │
+        │     └─ 游标持久化 → .cursor                                       │
+        └──────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+        ┌──────────────────────────────────────────────────────────────────┐
+        │  返回: cursor(int)        ← 供下游 Dream 追读取进度              │
+        └──────────────────────────────────────────────────────────────────┘
 
-        A defensive cap (*max_chars*, default ``_HISTORY_ENTRY_HARD_CAP``) is
-        applied as a final safety net: individual callers should cap their own
-        content more tightly; this default only exists to catch unintentional
-        large writes (e.g. an LLM echoing its input back as a "summary").
+        详细说明:
+        - strip_think: 清洗模板泄露(未闭合<think、<channel|>等)，
+          防止下游回放时污染上下文
+        - 原子锁: 防止并发写入读到相同游标产生重复记录
+        - 空内容处理: 清洗后变空仍写入空字符串，不回退用原始泄露文本
         """
-        limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        raw = entry.rstrip()
-        if len(raw) > limit:
-            if not self._oversize_logged:
-                self._oversize_logged = True
-                logger.warning(
-                    "history entry exceeds {} chars ({}); truncating. "
-                    "Usually means a caller forgot its own cap; "
-                    "further occurrences suppressed.",
-                    limit, len(raw),
-                )
-            raw = truncate_text(raw, limit)
-        # 游标分配和追加写入必须是原子操作，防止并发写入者读到相同游标导致重复记录。
-        # 防止并发写入者读到相同游标导致产生重复记录。
-        # 防止并发写入者读到相同游标导致产生重复记录。
-        with self._append_lock:
-            cursor = self._next_cursor()
-            if raw and not content:
-                logger.debug(
-                    "history entry {} stripped to empty (likely template leak); "
-                    "persisting empty content to avoid re-polluting context",
-                    cursor,
-                )
-            record = {"cursor": cursor, "timestamp": ts, "content": content}
-            if session_key:
-                record["session_key"] = session_key
-            with open(self.history_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self._cursor_file.write_text(str(cursor), encoding="utf-8")
-        return cursor
 
     @staticmethod
     def _valid_cursor(value: Any) -> int | None:
