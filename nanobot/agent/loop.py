@@ -11,6 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
+from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine
 
@@ -1217,6 +1218,36 @@ class AgentLoop:
 
     async def _state_save(self, ctx: TurnContext) -> str:
         logger.info("_state_save")
+        # ┌─────────────────────────────────────────────────────────────────┐
+        # │                     _state_save 保存流程                         │
+        # ├─────────────────────────────────────────────────────────────────┤
+        # │ 1. prepare_save_boundary(ctx)                                  │
+        # │    └─ 清理 continuation 元数据，计算本轮 save_skip               │
+        # │                                                                    │
+        # │ 2. 兜底 final_content（空回复时填充 fallback）                  │
+        # │                                                                    │
+        # │ 3. 计算延迟：latency_started_at → turn_latency_ms               │
+        # │    ├─ 内部延续 → 用 visible_run_started_at（原始用户起始时间）   │
+        # │    └─ 普通对话 → 用 turn_wall_started_at（本轮起始时间）         │
+        # │                                                                    │
+        # │ 4. _save_turn()                                                 │
+        # │    └─ 清洗 messages，跳过 save_skip 条旧消息                     │
+        # │       ├─ 丢弃孤立 tool_result                                  │
+        # │       ├─ 截断超长 tool_result 内容                               │
+        # │       ├─ 清理内容块（图片 base64 等）                            │
+        # │       └─ session.messages = 清洗后的新消息列表                   │
+        # │                                                                    │
+        # │ 5. record_turn_latency() → 上报延迟指标到事件总线               │
+        # │                                                                    │
+        # │ 6. [非临时对话] 文件上限 + 记忆合并                              │
+        # │    ├─ enforce_file_cap() → 超限归档到 raw_archive              │
+        # │    └─ maybe_consolidate_by_tokens() → 后台触发 Dream 压缩       │
+        # │                                                                    │
+        # │ 7. 清理本轮标记 + 持久化会话                                     │
+        # │    ├─ _clear_pending_user_turn()                                │
+        # │    ├─ _clear_runtime_checkpoint()                               │
+        # │    └─ sessions.save() → 最终写入存储后端                         │
+        # └─────────────────────────────────────────────────────────────────┘
         turn_continuation.prepare_save_boundary(ctx)
         if (
             (ctx.final_content is None or not ctx.final_content.strip())
@@ -1230,16 +1261,47 @@ class AgentLoop:
                 )
             """
 
+        # 内部延续（自动续写）时沿用原始用户的可见起始时间，
+        # 保证多段切片的总延迟准确；否则用本轮起始时间
         latency_started_at = (
             ctx.visible_run_started_at
             if turn_continuation.internal_continuation_inbound(ctx.msg.metadata)
             and ctx.visible_run_started_at is not None
             else ctx.turn_wall_started_at
         )
-        
-        if ctx.session is not None and ctx.all_messages:
-            ctx.session.messages = list(ctx.all_messages)
-            self.sessions.save(ctx.session)
+        # 将毫秒级延迟记录到 ctx，供下游保存和上报使用
+        ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
+        # 保存本轮消息及元数据到 session（含 save_skip 控制的部分保存）
+        self._save_turn(
+            ctx.session, ctx.all_messages, ctx.save_skip,
+            turn_latency_ms=ctx.turn_latency_ms,
+        )   
+        # 上报延迟指标到运行时事件总线（供 metrics/监控消费）
+        self._runtime_events().record_turn_latency(
+            ctx.session_key,
+            ctx.turn_latency_ms
+        )
+        if not ctx.ephemeral:
+            # 非临时对话：强制文件上限，必要时归档旧文件
+            ctx.session.enforce_file_cap(
+                on_archive=partial(self.context.memory.raw_archive, session_key=ctx.session_key)
+            )
+            # 后台触发记忆合并（基于 token 量判断是否需要压缩）
+            self._schedule_background(
+                self.consolidator.maybe_consolidate_by_tokens(
+                    ctx.session,
+                    replay_max_messages=self._max_messages,
+                )
+            )
+        # 清理本轮待处理标记，标记会话已响应
+        self._clear_pending_user_turn(ctx.session)
+        # 清除运行时的中间检查点状态
+        self._clear_runtime_checkpoint(ctx.session)
+        # 持久化会话到存储后端
+        self.sessions.save(ctx.session)
+        # if ctx.session is not None and ctx.all_messages:
+        #     ctx.session.messages = list(ctx.all_messages)
+        #     self.sessions.save(ctx.session)
         return "ok"
 
     @staticmethod
@@ -1343,11 +1405,272 @@ class AgentLoop:
     # ── 主循环：1 秒轮询 + dispatch 异步化 ──
 
     async def run_forever(self) -> None:
-        """主循环，每秒轮询一次 inbound 队列。
+        """主循环：1s 轮询 inbound 队列，收到消息异步 dispatch。
 
-        收到消息后直接用 create_task 异步 dispatch，
-        不阻塞主循环，可以同时处理多条消息。
-        符合原版模式：run 是 1s 监听，dispatch 异步处理。
+        ╔══════════════════════════════════════════════════════════════════╗
+        ║                    run_forever — 主事件循环                    ║
+        ╠══════════════════════════════════════════════════════════════════╣
+        ║  启动时连接 MCP 服务器（如有配置）                              ║
+        ║  注册 SIGINT/SIGTERM 信号 → 设置 self._running = False        ║
+        ║                                                               ║
+        ║  每 1s 轮询:                                                  ║
+        ║    msg = bus.consume_inbound()                                ║
+        ║     ├─ 有消息 → create_task(_dispatch(msg)) 异步处理          ║
+        ║     └─ 超时   → continue 继续轮询                             ║
+        ╚══════════════════════════════════════════════════════════════════╝
+
+        ╔══════════════════════════════════════════════════════════════════╗
+        ║                    _dispatch(msg) — 消息分发                   ║
+        ╠══════════════════════════════════════════════════════════════════╣
+        ║  1. 检查 _wants_stream → 设置 on_stream / on_stream_end       ║
+        ║  2. session_locks[session_key].acquire() 加锁                 ║
+        ║  3. _process_message(msg) → 状态机                            ║
+        ║  4. bus.publish_outbound(outbound) 推送回复                   ║
+        ║                                                               ║
+        ║  异常处理：                                                    ║
+        ║    CancelledError → 日志记录，继续                              ║
+        ║    其他异常 → 推送"抱歉，处理请求时出现异常"                ║
+        ╚══════════════════════════════════════════════════════════════════╝
+
+        ╔══════════════════════════════════════════════════════════════════╗
+        ║              _process_message(msg) — 状态机引擎              ║
+        ╠══════════════════════════════════════════════════════════════════╣
+        ║  输入: InboundMessage                                         ║
+        ║  输出: OutboundMessage | None                                 ║
+        ║                                                               ║
+        ║  while state != DONE:                                         ║
+        ║    handler = getattr(self, f"_state_{state.name.lower()}")     ║
+        ║    event = await handler(ctx)                                  ║
+        ║    next_state = _TRANSITIONS.get((state, event))              ║
+        ║    state = next_state or DONE                                 ║
+        ╚══════════════════════════════════════════════════════════════════╝
+
+        状态转换表 _TRANSITIONS:
+        ┌───────────┬───────────┬────────────┐
+        │ 当前状态  │ 事件      │ 下一状态   │
+        ├───────────┼───────────┼────────────┤
+        │ RESTORE   │ ok        │ COMPACT    │
+        │ RESTORE   │ error     │ DONE       │
+        │ COMPACT   │ ok        │ COMMAND    │
+        │ COMMAND   │ dispatch  │ BUILD      │
+        │ COMMAND   │ shortcut  │ DONE       │
+        │ BUILD     │ ok        │ RUN        │
+        │ RUN       │ ok        │ SAVE       │
+        │ RUN       │ error     │ DONE       │
+        │ SAVE      │ ok        │ RESPOND    │
+        │ RESPOND   │ ok        │ DONE       │
+        └───────────┴───────────┴────────────┘
+        未匹配的 (state, event) → DONE（安全兜底）
+
+        ╔══════════════════════════════════════════════════════════════════╗
+        ║                 各状态处理函数详细流程                        ║
+        ╠══════════════════════════════════════════════════════════════════╣
+        ║                                                               ║
+        ║  ┌─ RESTORE ──────────────────────────────────────────────┐  ║
+        ║  │  _state_restore(ctx)                                     │  ║
+        ║  │  1. prepare_message_media() 分离文档/图片                │  ║
+        ║  │  2. sessions.get_or_create() → ctx.session                │  ║
+        ║  │  3. runtime_events.session_turn_started() 通知监听者      │  ║
+        ║  │  4. workspace_scopes.persist_message_scope()              │  ║
+        ║  │  5. _restore_runtime_checkpoint() 崩溃恢复               │  ║
+        ║  │  6. _restore_pending_user_turn() 恢复未完成的轮次        │  ║
+        ║  │  返回: "ok"                                               │  ║
+        ║  └─────────────────────────────────────────────────────────┘  ║
+        ║                          │                                    ║
+        ║                          ▼                                    ║
+        ║  ┌─ COMPACT ──────────────────────────────────────────────┐  ║
+        ║  │  _state_compact(ctx)                                     │  ║
+        ║  │  AutoCompact.prepare_session()                            │  ║
+        ║  │    1. dream: 内部 session → 跳过                        │  ║
+        ║  │    2. 正在归档或已过期 → 从磁盘重载 session             │  ║
+        ║  │    3. _summaries 热缓存 → 取摘要                        │  ║
+        ║  │    4. session.metadata._last_summary 冷路径             │  ║
+        ║  │  ctx.pending_summary = 摘要文本                          │  ║
+        ║  │  返回: "ok"                                               │  ║
+        ║  └─────────────────────────────────────────────────────────┘  ║
+        ║                          │                                    ║
+        ║                          ▼                                    ║
+        ║  ┌─ COMMAND ─────────────────────────────────────────────┐  ║
+        ║  │  _state_command(ctx)                                     │  ║
+        ║  │  CommandRouter.dispatch() 匹配内置命令                   │  ║
+        ║  │  ├─ 匹配 → ctx.outbound, "shortcut"→DONE                   │  ║
+        ║  │  └─ 不匹配 → "dispatch" → BUILD                            │  ║
+        ║  └─────────────────────────────────────────────────────────┘  ║
+        ║                          │                                    ║
+        ║                          ▼                                    ║
+        ║  ┌─ BUILD ───────────────────────────────────────────────┐  ║
+        ║  │  _state_build(ctx)                                       │  ║
+        ║  │  1. maybe_consolidate_by_tokens() 后台触发在线压缩     │  ║
+        ║  │  2. _set_tool_context() 更新工具的路由信息              │  ║
+        ║  │  3. message_tool.start_turn() 初始化消息发送             │  ║
+        ║  │  4. 组装 user message:                                   │  ║
+        ║  │     纯文本 → {"role":"user","content": text}            │  ║
+        ║  │     含图片 → content = [{text}, {image_url}, ...]         │  ║
+        ║  │  ctx.all_messages = history + user message               │  ║
+        ║  │  返回: "ok"                                               │  ║
+        ║  └─────────────────────────────────────────────────────────┘  ║
+        ║                          │                                    ║
+        ║                          ▼                                    ║
+        ║  ┌─ RUN ────────────────────────────────────────────────┐  ║
+        ║  │  _state_run(ctx)                                         │  ║
+        ║  │  1. visible_run_started_at 兜底                        │  ║
+        ║  │  2. runtime_events.run_status_changed("running")          │  ║
+        ║  │  3. _run_agent_loop() → ReAct 循环 (见下方)             │  ║
+        ║  │  4. 解析 result → ctx.final_content / tools_used / ...  │  ║
+        ║  │  5. maybe_continue_turn(ctx) 检查是否需要续写           │  ║
+        ║  │  返回: "ok" / "error"                                    │  ║
+        ║  └─────────────────────────────────────────────────────────┘  ║
+        ║                          │                                    ║
+        ║                          ▼                                    ║
+        ║  ┌─ SAVE ────────────────────────────────────────────────┐  ║
+        ║  │  _state_save(ctx)                                        │  ║
+        ║  │  1. prepare_save_boundary() 计算 save_skip              │  ║
+        ║  │  2. 空回复兜底 → EMPTY_FINAL_RESPONSE_MESSAGE             │  ║
+        ║  │  3. 计算 turn_latency_ms                                  │  ║
+        ║  │  4. _save_turn(): 清洗消息并追加到 session.messages        │  ║
+        ║  │  5. record_turn_latency() 上报延迟指标                    │  ║
+        ║  │  6. [非临时对话]:                                        │  ║
+        ║  │     enforce_file_cap() + maybe_consolidate_by_tokens()   │  ║
+        ║  │  7. 清理本轮标记 + sessions.save()                        │  ║
+        ║  │  返回: "ok"                                               │  ║
+        ║  └─────────────────────────────────────────────────────────┘  ║
+        ║                          │                                    ║
+        ║                          ▼                                    ║
+        ║  ┌─ RESPOND ─────────────────────────────────────────────┐  ║
+        ║  │  _state_respond(ctx)                                     │  ║
+        ║  │  构造 OutboundMessage → ctx.outbound                   │  ║
+        ║  │  返回: "ok"                                               │  ║
+        ║  └─────────────────────────────────────────────────────────┘  ║
+        ║                          │                                    ║
+        ║                          ▼                                    ║
+        ║                      ╔══════╗                               ║
+        ║                      ║ DONE ║                               ║
+        ║                      ╚══════╝                               ║
+        ╚══════════════════════════════════════════════════════════════════╝
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │  _run_agent_loop() — ReAct 循环（RUN 状态内部）                  │
+        ├──────────────────────────────────────────────────────────────────────┤
+        │  绑定运行时 ContextVar:                                         │
+        │    file_state_token: bind_file_states(session_file_states)        │
+        │    request_token:   bind_request_context(channel, chat_id, ...)      │
+        │    workspace_token: bind_workspace_scope(effective_scope)           │
+        │                                                                      │
+        │  调用 AgentRunner.run(AgentRunSpec(...))— 内部 ReAct 循环             │
+        │    ┌────────────────────────────────────────────────────────────────┐ │
+        │    │ while iteration < max_iterations:                                 │ │
+        │    │  1. _try_drain_injections()                                      │ │
+        │    │     ├─ injection_callback(_drain_pending) 排干 pending_queue     │ │
+        │    │     │   ├─ 非阻塞取子 agent 结果                                   │ │
+        │    │     │   └─ 队列空但子 agent 在跑 → 阻塞等 300s                   │ │
+        │    │     └─ 无注入但有活跃 goal → goal_continue_message                │ │
+        │    │                                                                  │ │
+        │    │  2. provider.chat() 调用 LLM                                    │ │
+        │    │     流式 → on_stream(delta) 实时推送                              │ │
+        │    │     重试 → on_retry_wait(reason)                                  │ │
+        │    │     checkpoint → _checkpoint(payload) 保存进度                    │ │
+        │    │                                                                  │ │
+        │    │  3. 分支判断 finish_reason:                                       │ │
+        │    │     ├─ tool_calls → 执行工具 → drain_injections → continue      │ │
+        │    │     │   ├─ 并行执行 concurrent_tools                              │ │
+        │    │     │   ├─ 超长结果截断 max_tool_result_chars                      │ │
+        │    │     │   └─ 工具错误 → "tool_error"                               │ │
+        │    │     ├─ stop / end_turn → break                                   │ │
+        │    │     ├─ max_tokens → length_recovery 续写                         │ │
+        │    │     └─ error → 重试或报错                                      │ │
+        │    │                                                                  │ │
+        │    │  4. 每轮迭代后:                                                │ │
+        │    │     hook.after_iteration() + checkpoint                           │ │
+        │    │     检查 goal_active / pending_queue 决定是否继续                │ │
+        │    └────────────────────────────────────────────────────────────────┘ │
+        │                                                                      │
+        │  返回: (final_content, tools_used, messages, stop_reason,            │
+        │         had_injections)                                              │
+        │                                                                      │
+        │  finally: 清理 ContextVar 绑定                                       │
+        │    reset_workspace_scope(workspace_token)                              │
+        │    reset_request_context(request_token)                                  │
+        │    reset_file_states(file_state_token)                                   │
+        └──────────────────────────────────────────────────────────────────────┘
+        
+        
+                ┌──────────────────────────────────────────────────────────────────────┐
+                │  多 Agent — SubagentManager（主 agent 内部的多 agent 模型）        │
+                ├──────────────────────────────────────────────────────────────────────┤
+                │  模型：Master-Slave（主 agent spawn 子 agent，子 agent 回传结果）    │
+                │                                                                      │
+                │  触发入口：LLM 在 ReAct 循环中调用 spawn 工具                      │
+                │                                                                      │
+                │  SpawnTool.execute():                                               │
+                │    1. 检查并发上限 max_concurrent_subagents（默认 1）               │
+                │    2. SubagentManager.spawn(task, label, temperature, ...)            │
+                │       ├─ 生成 task_id (uuid[:8])                                     │
+                │       ├─ 创建 SubagentStatus 跟踪状态                                │
+                │       ├─ _task_statuses[task_id] = status                            │
+                │       └─ bg_task = asyncio.create_task(_run_subagent(...))            │
+                │          ├─ _running_tasks[task_id] = bg_task                        │
+                │          ├─ _session_tasks[session_key].add(task_id)                  │
+                │          └─ done_callback: 从 _running_tasks / _task_statuses 清理    │
+                │    3. 返回 "Subagent [...] started" — 主 agent 继续当前回合        │
+                │                                                                      │
+                │  _run_subagent(task_id, task, origin, ...):                          │
+                │    1. _build_tools() 构建隔离的 ToolRegistry（独立 FileStates）    │
+                │    2. _build_subagent_prompt() 构建聚焦的子 agent system prompt    │
+                │    3. AgentRunner.run(AgentRunSpec(...)) 独立 ReAct 循环              │
+                │       ├─ 自己的 model / temperature / max_iterations                 │
+                │       ├─ 自己的 hook（_SubagentHook 记录 tool_events + usage）       │
+                │       └─ 结果: stop_reason / final_content                            │
+                │    4. _announce_result():                                            │
+                │       ├─ render_template("agent/subagent_announce.md") 构建通知消息  │
+                │       ├─ InboundMessage(channel="system", sender_id="subagent", ...)  │
+                │       └─ bus.publish_inbound(msg) → bus → _dispatch → 主 agent 接收  │
+                │    5. 异常时捕获 Exception → status.error + announce "Error: {e}"    │
+                │                                                                      │
+                │  结果回传路径（关键！）：                                           │
+                │    _announce_result()                                                │
+                │      └─ bus.publish_inbound()                                      │
+                │         └─ bus.consume_inbound()  →  主 agent 的 _dispatch()        │
+                │            ├─ [主 agent 还在同一回合中]                              │
+                │            │  msg.session_key_override = 主 session                  │
+                │            │  → _dispatch 加锁时发现 session 被当前回合占用           │
+                │            │  → msg 投递到 pending_queue                             │
+                │            │  → _drain_pending() 在下一轮迭代前取出注入              │
+                │            │    ├─ 非阻塞取消息                                      │
+                │            │    └─ 队列空但子 agent 在跑 → 阻塞等 300s             │
+                │            │  → 注入为 user message → LLM 看到结果继续处理           │
+                │            │                                                        │
+                │            └─ [主 agent 回合已结束]                                  │
+                │               → _dispatch 正常加锁 → _process_message()              │
+                │               → subagent announce 作为新轮次被 LLM 处理               │
+                │                                                                      │
+                │  _process_system_message()（处理 sender_id="subagent" 的消息）:      │
+                │    1. 正常走 COMPACT → BUILD 流程                                   │
+                │    2. is_subagent=True → current_role="assistant"，回放历史         │
+                │    3. build_messages(current_message="") 空用户消息，只注入历史      │
+                │    4. _run_agent_loop() 执行 ReAct 让主 agent 消化子 agent 结果     │
+                │                                                                      │
+                │  并发控制：                                                          │
+                │    SubagentManager:                                                 │
+                │      _running_tasks:  dict[str, asyncio.Task]  全部运行中的子 agent │
+                │      _session_tasks:  dict[str, set[str]]    按 session 分组的索引 │
+                │      _task_statuses:  dict[str, SubagentStatus]  实时状态跟踪      │
+                │      max_concurrent_subagents:  全局并发上限（默认 1）            │
+                │      get_running_count_by_session():  session 级别的子 agent 计数 │
+                │      cancel_by_session():  取消某个 session 的所有子 agent        │
+                │    AgentLoop 集成:                                                 │
+                │      _cancel_active_tasks(session_key) 停止任务时调用               │
+                │      subagents.get_running_count_by_session() 判断是否要阻塞等待     │
+                │      _drain_pending() 在队列空但子 agent 在跑时阻塞 300s            │
+                │                                                                      │
+                │  生命周期总结：                                                    │
+                │    1. spawn（主 agent 的 ReAct 迭代中）                            │
+                │    2. _run_subagent 后台 Task（独立 asyncio 任务）                │
+                │    3. _announce_result（通过 bus 发布 InboundMessage）              │
+                │    4. _dispatch → pending_queue（如果主 agent 还在跑）或直接处理    │
+                │    5. _drain_pending 注入（同回合）/ _process_system_message（新回合）│
+                │    6. 主 agent 处理结果（LLM 看到注入的历史）                       │
+                └──────────────────────────────────────────────────────────────────────┘
+        
         """
         logger.debug(f"self._mcp_servers {self._mcp_servers},self._mcp_connected {self._mcp_connected}")
         if self._mcp_servers and not self._mcp_connected:
@@ -1378,6 +1701,11 @@ class AgentLoop:
                     # 异步处理，不阻塞主循环
                     asyncio.create_task(self._dispatch(msg))
                 except asyncio.TimeoutError:
+                    logger.debug("asyncio.TimeoutError")
+                    self.auto_compact.check_expired(
+                        self._schedule_background,
+                        active_session_keys=self._pending_queues.keys(),
+                    )
                     # 超时是正常的，继续轮询
                     continue
         finally:
@@ -1387,6 +1715,18 @@ class AgentLoop:
                     loop.remove_signal_handler(sig)
                 except (NotImplementedError, RuntimeError):
                     pass
+
+    def _schedule_background(self, coro) -> None:
+        """把一个协程包装成后台任务执行，调用方不用等它完成。
+
+        - 用 asyncio.create_task 把协程丢进事件循环
+        - 把 task 记到 _background_tasks 列表，避免被 GC 回收
+        - 注册回调，task 结束后自动从列表移除
+        - shutdown 时遍历 _background_tasks 全部 cancel 等待
+        """
+        task = asyncio.create_task(coro)           # 创建异步任务，立即开始执行
+        self._background_tasks.append(task)         # 持有引用，防止 task 被 GC
+        task.add_done_callback(self._background_tasks.remove)  # 跑完后自动从列表移除
 
     async def start(self) -> None:
         """在后台启动主循环。"""
@@ -1637,3 +1977,7 @@ class AgentLoop:
         """Persist the latest in-flight turn state into session metadata."""
         session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
         self.sessions.save(session)
+        task = asyncio.create_task(coro)  # 创建异步任务，立即开始执行
+        self._background_tasks.append(task)  # 持有引用，防止 task 被 GC
+        # task 完成后自动从列表移除，避免内存泄漏
+        task.add_done_callback(self._background_tasks.remove)

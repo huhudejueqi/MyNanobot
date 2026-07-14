@@ -762,7 +762,25 @@ class Consolidator:
         self,
         session: Session,
     ) -> tuple[int, str]:
-        """从完整的未合并会话尾部估算 prompt token 数。"""
+        """估算当前 session 的 prompt token 总量。
+
+        用于判断是否需要触发记忆合并（consolidation）。
+        返回 (estimated_tokens, source_label)，其中 source_label 标识估算方式。
+
+        流程：
+          1. _full_unconsolidated_history(session)
+             └─ 从会话尾部截取 last_consolidated 之后的消息作为未合并历史
+          2. 从 session.metadata 中取出上一次归档的摘要 _last_summary
+             └─ 如果 session 之前被压缩过，摘要会参与 token 估算
+          3. _build_messages(history, session_summary=summary, ...)
+             └─ 构造一条探测用的完整消息列表，包含：
+                ├─ 系统提示（含身份、工具契约、记忆等）
+                ├─ 未合并的对话历史
+                ├─ 已归档的旧摘要
+                └─ 当前消息占位符 "[token-probe]"
+          4. estimate_prompt_tokens_chain(provider, model, probe_messages, tool_defs)
+             └─ 调用 tokenizer（如 tiktoken）逐条消息估算 token，累加返回
+        """
         history = self._full_unconsolidated_history(session, include_timestamps=True)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
 # 在估算中纳入已归档的摘要，确保预算准确。
@@ -868,6 +886,51 @@ class Consolidator:
         预算为 completion token 和安全缓冲区预留了空间，
         确保 LLM 请求不会超出上下文窗口限制。
         """
+        #
+        # ┌─────────────────────────────────────────────────────────────────┐
+        # │                  maybe_consolidate_by_tokens 执行流程                   │
+        # ├─────────────────────────────────────────────────────────────────┤
+        # │ 前置条件：context_window_tokens <= 0 → 直接返回                  │
+        # │                                                                    │
+        # │ 1. 加锁 + 刷新 session 引用                                      │
+        # │    └─ 避免 AutoCompact 替换 session 对象后操作旧引用              │
+        # │                                                                    │
+        # │ 2. 计算预算                                                       │
+        # │    ├─ budget  = _input_token_budget                              │
+        # │    │    = context_window_tokens - max_completion_tokens - safety  │
+        # │    └─ target = budget * consolidation_ratio（压缩目标阈值）       │
+        # │                                                                    │
+        # │ 3. _consolidate_replay_overflow(session)                         │
+        # │    └─ 如果 session 有 replay 溢出（Mediasoup 等特殊场景），先归档 │
+        # │                                                                    │
+        # │ 4. estimate_session_prompt_tokens(session)                       │
+        # │    └─ 估算当前 prompt token 总量                                  │
+        # │    ├─ estimated <= 0  → 保存摘要 + 直接返回                       │
+        # │    ├─ estimated < budget → 未超预算，保存摘要 + 直接返回（idle） │
+        # │    └─ estimated >= budget → 进入压缩循环                          │
+        # │                                                                    │
+        # │ 5. 多轮压缩循环（最多 _MAX_CONSOLIDATION_ROUNDS 轮）              │
+        # │    ┌────────────────────────────────────────────────────────┐    │
+        # │    │ 每轮：                                                 │    │
+        # │    │   a. 如果 estimated <= target → break（已达到目标）     │    │
+        # │    │   b. pick_consolidation_boundary()                     │    │
+        # │    │      └─ 在 last_consolidated ~ 尾部之间挑一个安全边界   │    │
+        # │    │   c. 取 chunk = messages[last_consolidated:end_idx]    │    │
+        # │    │   d. archive(chunk) → 发给 LLM 总结                    │    │
+        # │    │      ├─ 成功 → 返回摘要文本                            │    │
+        # │    │      └─ 失败 → raw_archive() 按 [RAW] 原文转储         │    │
+        # │    │   e. 推进 last_consolidated = end_idx                  │    │
+        # │    │   f. sessions.save(session)                            │    │
+        # │    │   g. 如果 archive() 失败 → break（不继续重试）          │    │
+        # │    │   h. 重新估算 token，继续下一轮                        │    │
+        # │    └────────────────────────────────────────────────────────┘    │
+        # │                                                                    │
+        # │ 6. 将本轮新摘要写入 session metadata                              │
+        # │    └─ _persist_last_summary(session, last_summary)               │
+        # │                                                                    │
+        # │ 注意：无论 archive() 成功还是失败，last_consolidated 都会推进，    │
+        # │ 避免同一段消息被反复处理产生重复 [RAW] 条目。                      │
+        # └─────────────────────────────────────────────────────────────────┘
         if self.context_window_tokens <= 0:
             return
         lock = self.get_lock(session.key)

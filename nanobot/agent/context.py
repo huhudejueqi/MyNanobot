@@ -148,40 +148,85 @@ class ContextBuilder:
 
     def build_system_prompt(
         self,
-        skill_names:list[str]|None = None,
-        channel:str|None = None,
-        session_summary: str|None = None,
-        workspace:Path| None = None,
-        include_memory_recent_history:bool=True,
+        skill_names: list[str] | None = None,
+        channel: str | None = None,
+        session_summary: str | None = None,
+        workspace: Path | None = None,
+        include_memory_recent_history: bool = True,
         session_key: str | None = None,
-        unified_session: bool = False
-    )->str:
+        unified_session: bool = False,
+    ) -> str:
+        """构建 LLM 的 System Prompt，逐层组装身份、记忆、技能、历史等上下文。
+
+        组装顺序（从顶到底）：
+        ┌─────────────────────────────────────────────────────────┐
+        │ ① _get_identity()                                     │
+        │   ├─ templates/agent/identity.md（身份模板）           │
+        │   ├─ 工作区路径 workspace_path                        │
+        │   ├─ 运行时信息 runtime（OS / Python 版本）           │
+        │   └─ 平台安全策略 platform_policy                     │
+        ├─────────────────────────────────────────────────────────┤
+        │ ② _load_bootstrap_files()                             │
+        │   读取工作区根目录下的引导文件：                       │
+        │   SOUL.md（人格）、USER.md（用户画像）、             │
+        │   MEMORY.md（长期记忆）                               │
+        ├─────────────────────────────────────────────────────────┤
+        │ ③ tool_contract.md（工具契约模板）                    │
+        │   定义 tool call 的格式规范                            │
+        ├─────────────────────────────────────────────────────────┤
+        │ ④ # Memory（长期记忆上下文）                          │
+        │   从 memory/MEMORY.md 读取，跳过未自定义的模板内容    │
+        ├─────────────────────────────────────────────────────────┤
+        │ ⑤ # Active Skills（始终激活的技能）                   │
+        │   always: true 的 skill 完整内容直接内联               │
+        ├─────────────────────────────────────────────────────────┤
+        │ ⑥ # Skills（技能清单）                                │
+        │   其余 skill 的摘要列表，LLM 按需 read_file 读取      │
+        ├─────────────────────────────────────────────────────────┤
+        │ ⑦ # Recent History（未处理的 Dream 历史摘要）          │
+        │   history.jsonl 中未被 Dream 消费的条目，最多 30 条   │
+        ├─────────────────────────────────────────────────────────┤
+        │ ⑧ [Archived Context Summary]（压缩上下文摘要）         │
+        │   上一轮 consolidate 产生的会话摘要（如存在）          │
+        └─────────────────────────────────────────────────────────┘
+
+        各层之间以 --- 分隔，最终拼接为一条 system message。
+        """
         root = workspace or self.workspace
-        parts = [self._get_identity(channel=channel,workspace=root)]
-        
-        bootstrap = self._load_bootstrap_files(root) #三大提示词
+        # ① 身份模板 + 工作区路径 + 运行时 + 平台安全策略
+        parts = [self._get_identity(channel=channel, workspace=root)]
+
+        # ② 工作区引导文件：SOUL.md / USER.md / MEMORY.md
+        bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
             parts.append(bootstrap)
-        
+
+        # ③ 工具调用契约（JSON Schema 格式规范）
         parts.append(render_template("agent/tool_contract.md"))
+
+        # ④ 长期记忆（跳过模板默认内容）
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
             parts.append(f"# Memory\n\n{memory}")
 
+        # ⑤ always=true 的技能：完整内容内联到 System Prompt
         always_skills = self.skills.get_always_skills()
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
+        # ⑥ 非 always 技能：仅列出摘要，LLM 按需 read_file 读取
         skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+
+        # ⑦ history.jsonl 中的未处理历史（Dream 尚未消费的条目）
         if include_memory_recent_history:
             entries = self.memory.read_recent_history_for_prompt(
                 since_cursor=self.memory.get_last_dream_cursor(),
-                session_key = session_key,
-                unified_session = unified_session
+                session_key=session_key,
+                unified_session=unified_session,
             )
             if entries:
                 capped = entries[-self._MAX_RECENT_HISTORY:]
@@ -190,6 +235,8 @@ class ContextBuilder:
                 )
                 history_text = truncate_text(history_text, self._MAX_HISTORY_CHARS)
                 parts.append("# Recent History\n\n" + history_text)
+
+        # ⑧ 上一轮 consolidate 的会话摘要
         if session_summary:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 

@@ -36,7 +36,7 @@ class AutoCompact:
 
     @staticmethod
     def _format_summary(text: str, last_active: datetime) -> str:
-        return f"Previous conversation summary (last active {last_active.isoformat()}):\n{text}"
+        return f"Previous conversation summary (last active {last_active.isoformat()}).\n{text}"
 
     @classmethod
     def _is_internal_session(cls, key: str) -> bool:
@@ -44,19 +44,33 @@ class AutoCompact:
 
     def check_expired(self, schedule_background: Callable[[Coroutine], None],
                       active_session_keys: Collection[str] = ()) -> None:
-        """Schedule archival for idle sessions, skipping those with in-flight agent tasks."""
+        """扫描所有 session，把超时不活跃的归档成摘要，释放内存。
+
+        跳过条件（满足任一即跳过）：
+        - key 为空
+        - 内部 session（dream: 前缀）
+        - 正在归档中的（_archiving）
+        - 正在被 agent 处理中的（active_session_keys）
+        - 未达到 TTL 过期时间
+        """
         now = datetime.now()
+        # 遍历所有已持久化的 session 元信息列表
         for info in self.sessions.list_sessions():
             key = info.get("key", "")
+            # 跳过无效 key、内部 session、以及已在归档队列中的
             if not key or self._is_internal_session(key) or key in self._archiving:
                 continue
+            # 跳过正在被 agent 处理中的 session（防止在对话中途归档）
             if key in active_session_keys:
                 continue
+            # 检查是否超过 TTL，没超就跳过
             if self._is_expired(info.get("updated_at"), now):
-                self._archiving.add(key)
+                self._archiving.add(key)  # 标记为正在归档，防止重复调度
+                # 把归档任务丢到事件循环后台跑，不等它完成
                 schedule_background(self._archive(key))
 
     async def _archive(self, key: str) -> None:
+        """异步归档一个过期 session：压缩历史记录为摘要，存入 session 元数据。"""
         if self._is_internal_session(key):
             self._archiving.discard(key)
             return
