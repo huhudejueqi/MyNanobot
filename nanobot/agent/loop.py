@@ -1207,6 +1207,7 @@ class AgentLoop:
                         ctx.tools_used)
         except Exception as e:
             ctx.error = str(e)
+            logger.exception("LLM 异常详细")
             logger.error("LLM 异常: %s", e)
             return "error"
         finally:
@@ -1701,7 +1702,7 @@ class AgentLoop:
                     # 异步处理，不阻塞主循环
                     asyncio.create_task(self._dispatch(msg))
                 except asyncio.TimeoutError:
-                    logger.debug("asyncio.TimeoutError")
+                    # logger.debug("asyncio.TimeoutError")
                     self.auto_compact.check_expired(
                         self._schedule_background,
                         active_session_keys=self._pending_queues.keys(),
@@ -1977,7 +1978,3 @@ class AgentLoop:
         """Persist the latest in-flight turn state into session metadata."""
         session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
         self.sessions.save(session)
-        task = asyncio.create_task(coro)  # 创建异步任务，立即开始执行
-        self._background_tasks.append(task)  # 持有引用，防止 task 被 GC
-        # task 完成后自动从列表移除，避免内存泄漏
-        task.add_done_callback(self._background_tasks.remove)

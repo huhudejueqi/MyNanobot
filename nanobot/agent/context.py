@@ -20,6 +20,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import InboundMessage
 from nanobot.session.goal_state import goal_state_runtime_lines
+from nanobot.agent.tools.todo import todo_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
@@ -27,6 +28,7 @@ from nanobot.utils.helpers import (
     truncate_text,
 )
 from nanobot.utils.prompt_templates import render_template
+from loguru import logger
 
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -160,11 +162,11 @@ class ContextBuilder:
 
         组装顺序（从顶到底）：
         ┌─────────────────────────────────────────────────────────┐
-        │ ① _get_identity()                                     │
-        │   ├─ templates/agent/identity.md（身份模板）           │
-        │   ├─ 工作区路径 workspace_path                        │
-        │   ├─ 运行时信息 runtime（OS / Python 版本）           │
-        │   └─ 平台安全策略 platform_policy                     │
+        │ ① _get_identity()                                       │
+        │   ├─ templates/agent/identity.md（身份模板）             │
+        │   ├─ 工作区路径 workspace_path                           │
+        │   ├─ 运行时信息 runtime（OS / Python 版本）               │
+        │   └─ 平台安全策略 platform_policy                        │
         ├─────────────────────────────────────────────────────────┤
         │ ② _load_bootstrap_files()                             │
         │   读取工作区根目录下的引导文件：                       │
@@ -335,8 +337,12 @@ class ContextBuilder:
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
+        logger.debug(r"Runtime context: goal_lines={},/n todo_lines={}",
+                     goal_state_runtime_lines(session_metadata),
+                     todo_state_runtime_lines(session_metadata))
         extra = [
             *goal_state_runtime_lines(session_metadata),
+            *todo_state_runtime_lines(session_metadata),
         ]
         if runtime_state is not None and inbound_message is not None:
             extra.extend(runtime_lines(runtime_state, inbound_message, root, skip=skip_runtime_lines))

@@ -278,12 +278,11 @@ class Tool(ABC):
 
 
 def tool_parameters(schema: dict[str, Any]) -> Callable[[type[_ToolT]], type[_ToolT]]:
-    """Class decorator: attach JSON Schema and inject a concrete ``parameters`` property.
+    """类装饰器：给 Tool 子类绑定 JSON Schema 参数定义。
+    用法：用 @tool_parameters 替代手写 @property def parameters。
+    schema 保存在类上，每次访问返回深拷贝，防止意外修改。
 
-    Use on ``Tool`` subclasses instead of writing ``@property def parameters``. The
-    schema is stored on the class and returned as a fresh copy on each access.
-
-    Example::
+    示例：
 
         @tool_parameters({
             "type": "object",
@@ -295,14 +294,15 @@ def tool_parameters(schema: dict[str, Any]) -> Callable[[type[_ToolT]], type[_To
     """
 
     def decorator(cls: type[_ToolT]) -> type[_ToolT]:
-        frozen = deepcopy(schema)
+        frozen = deepcopy(schema)  # 冻结 schema，防止后续意外修改原对象
 
         @property
         def parameters(self: Any) -> dict[str, Any]:
-            return deepcopy(frozen)
+            return deepcopy(frozen)  # 每次访问返回新拷贝，避免调用方篡改
 
         cls.parameters = parameters  # type: ignore[assignment]
 
+        # 如果 parameters 在抽象方法列表里，把它移除（现在已有具体实现）
         abstract = getattr(cls, "__abstractmethods__", None)
         if abstract is not None and "parameters" in abstract:
             cls.__abstractmethods__ = frozenset(abstract - {"parameters"})  # type: ignore[misc]
