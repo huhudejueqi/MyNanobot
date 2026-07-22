@@ -89,6 +89,66 @@ def _stop_mcp_servers() -> None:
             proc.kill()
 
 
+async def _send_and_exit(agent: AgentLoop, message: str) -> None:
+    """发送一条消息，等待回复后打印并退出。"""
+    from nanobot.bus.events import InboundMessage, OutboundMessage
+    from datetime import datetime
+
+    # 设空回调，避免 _state_run 的 finally 块报 AttributeError
+    async def _noop(): pass
+    agent.on_llm_end = _noop
+
+    await agent.start()
+    await asyncio.sleep(0.5)
+
+    turn_done = asyncio.Event()
+    result_content = ""
+
+    async def _consume() -> None:
+        nonlocal result_content
+        while not turn_done.is_set():
+            try:
+                msg = await asyncio.wait_for(
+                    agent.bus.consume_outbound(), timeout=60.0,
+                )
+            except asyncio.TimeoutError:
+                turn_done.set()
+                break
+            meta = msg.metadata or {}
+            if meta.get("_stream_delta"):
+                print(msg.content, end="", flush=True)
+                continue
+            if meta.get("_stream_end"):
+                print(flush=True)
+                continue
+            if msg.content:
+                result_content = msg.content
+                turn_done.set()
+
+    consumer = asyncio.create_task(_consume())
+    await agent.bus.publish_inbound(InboundMessage(
+        channel="cli",
+        sender_id=f"cli_user_{int(asyncio.get_running_loop().time())}",
+        chat_id="chat_send",
+        content=message,
+        metadata={"_wants_stream": True},
+    ))
+    await asyncio.wait_for(turn_done.wait(), timeout=120.0)
+    consumer.cancel()
+    try:
+        await consumer
+    except asyncio.CancelledError:
+        pass
+    if result_content:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        Console(file=sys.stdout).print()
+        Console(file=sys.stdout).print("[cyan]🤖 MyNanobot[/cyan]")
+        Console(file=sys.stdout).print(Markdown(result_content))
+        Console(file=sys.stdout).print()
+    await agent.stop()
+
+
 def main():
     log_file = setup_logging()
     _start_mcp_servers()
@@ -97,6 +157,12 @@ def main():
     print("读取 ~/.nanobot/config.json...")
     agent = AgentLoop.from_config(config)
     print(f"模型: {agent.model}, provider: {type(agent.provider).__name__}")
+
+    # ── --send 模式：发送一条消息然后退出 ──
+    if len(sys.argv) > 2 and sys.argv[1] == "--send":
+        asyncio.run(_send_and_exit(agent, sys.argv[2]))
+        _stop_mcp_servers()
+        return
 
     try:
         asyncio.run(run_cli(agent, log_file=log_file))

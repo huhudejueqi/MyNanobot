@@ -18,6 +18,7 @@ from typing import Any
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.agent.tools.todo import TODO_STATE_KEY
 from nanobot.cli import AsyncCli, CliConfig
 from nanobot.cli.stream import StreamRenderer
 
@@ -56,7 +57,7 @@ def parse_media_input(text: str) -> tuple[str, list[str], list[str]]:
 
 CLI_COMMANDS = [
     "/new", "/list", "/switch", "/help", "/exit",
-    "/ping", "/time", "/version",
+    "/plan", "/plan_mode", "/ping", "/time", "/version",
 ]
 
 
@@ -74,10 +75,12 @@ def print_banner() -> None:
     print("=" * 50)
     print("  输入消息开始对话")
     print("  @/路径   附加文件（如 @/tmp/test.png）")
+    print("  /plan    设置/查看任务清单 例: /plan 查天气|订酒店")
+    print("  /plan_mode  开启/关闭强制 planning 模式")
     print("  /new     新建对话")
     print("  /list    列出所有对话")
     print("  /switch  切换到指定对话")
-    print("  ↑↓ 历史  Tab 补全")
+    print("  /help    显示所有命令")
     print("  /exit    退出")
     print()
 
@@ -162,10 +165,62 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
                 if text == "/help":
                     cli.output(
                         "可用命令: /new, /list, /switch <n>, "
-                        "/ping, /time, /version, /help, /exit"
+                        "/plan, /plan_mode, /ping, /time, /version, /help, /exit"
                     )
                     cli.output('附件: @/path/to/file 或 @"含空格的路径"')
                     cli.output("键盘: ↑↓ 历史  ←→ 光标  Tab 补全  Ctrl+D 退出")
+                    continue
+
+                # ── planning 命令 ──
+                if text.startswith("/plan"):
+                    args = text[5:].strip()
+                    sess = agent.sessions.get_or_create(current_chat_id())
+                    if args == "clean":
+                        sess.metadata.pop(TODO_STATE_KEY, None)
+                        agent.sessions.save(sess)
+                        cli.output("[已清空 planning 任务清单]")
+                    elif args:
+                        items = []
+                        for i, task_text in enumerate(args.split("|"), 1):
+                            task_text = task_text.strip()
+                            if task_text:
+                                items.append({"id": str(i), "text": task_text, "status": "pending"})
+                        if items:
+                            sess.metadata[TODO_STATE_KEY] = {"items": items}
+                            agent.sessions.save(sess)
+                            cli.output(f"[已设置 {len(items)} 个 planning 任务]")
+                            for item in items:
+                                cli.output(f"  [ ] #{item['id']}: {item['text']}")
+                    else:
+                        blob = sess.metadata.get(TODO_STATE_KEY)
+                        if not blob or not blob.get("items"):
+                            cli.output("当前没有 planning 任务")
+                        else:
+                            cli.output("当前 planning 任务:")
+                            done = 0
+                            for item in blob['items']:
+                                marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(item['status'], "[?]")
+                                cli.output(f"  {marker} #{item['id']}: {item['text']}")
+                                if item['status'] == "completed":
+                                    done += 1
+                            cli.output(f"  ({done}/{len(blob['items'])} completed)")
+                    continue
+
+                # ── plan_mode 命令 ──
+                if text.startswith("/plan_mode"):
+                    args = text[10:].strip()
+                    sess = agent.sessions.get_or_create(current_chat_id())
+                    if args == "on":
+                        sess.metadata["plan_mode"] = True
+                        agent.sessions.save(sess)
+                        cli.output("[已开启强制 planning 模式]")
+                    elif args == "off":
+                        sess.metadata["plan_mode"] = False
+                        agent.sessions.save(sess)
+                        cli.output("[已关闭强制 planning 模式]")
+                    else:
+                        status = "开启" if sess.metadata.get("plan_mode") else "关闭"
+                        cli.output(f"当前 planning 模式: {status}")
                     continue
 
                 # ── 解析附件 ──

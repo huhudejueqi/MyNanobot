@@ -776,7 +776,7 @@ class AgentLoop:
                 await on_stream(result.final_content or "")
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
-            logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+            logger.error("LLM returned error: %s", (result.final_content or "")[:200])
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
 
@@ -1027,7 +1027,12 @@ class AgentLoop:
             self.sessions.save(ctx.session)
         if self._restore_pending_user_turn(ctx.session):
             self.sessions.save(ctx.session)
-        # ctx.history = list(ctx.session.messages)
+        # 从 session 加载历史消息，供 BUILD 阶段注入 LLM 上下文
+        ctx.history = ctx.session.get_history(
+            max_messages=self._max_messages,
+            max_tokens=0,
+            include_timestamps=True,
+        )
         return "ok"
     
     def _prepare_message_media(self, content: str, media: list[str]) -> tuple[str, list[str]]:
@@ -1129,6 +1134,11 @@ class AgentLoop:
         logger.info("_state_build")
         messages = list(ctx.history)
         content_text = ctx.msg.content
+        # ── 强制 planning 模式：注入 planning 指令 ──
+        if ctx.session and ctx.session.metadata.get("plan_mode"):
+            plan_prompt = "\n[System: 当前为强制 planning 模式。对于需要多步完成的任务，请先调用 todo 工具创建任务清单，然后逐项执行并更新状态。]"
+            content_text = content_text + plan_prompt
+
         media = ctx.msg.media
 
         if media:
@@ -1791,7 +1801,7 @@ class AgentLoop:
         current_role = "assistant" if is_subagent else "user"
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
-            "max_tokens": self._replay_token_budget(),
+            "max_tokens": 0,
             "include_timestamps": True,
             "extend_to_user": is_subagent,
         }
