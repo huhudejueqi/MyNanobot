@@ -1332,9 +1332,10 @@ class AgentLoop:
         metadata: dict[str, Any] = {}
         if ctx.on_stream is not None:
             metadata["_streamed"] = True
+        fc = ctx.final_content or ""
         ctx.outbound = OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content=ctx.final_content or "",
+            content=fc,
             metadata=metadata,
         )
         return "ok"

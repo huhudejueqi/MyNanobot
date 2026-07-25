@@ -158,6 +158,10 @@ def main():
     agent = AgentLoop.from_config(config)
     print(f"模型: {agent.model}, provider: {type(agent.provider).__name__}")
 
+    # 注册 token / cost 统计钩子
+    from nanobot.utils.pricing import CostTrackingHook
+    agent._extra_hooks = [CostTrackingHook(model=agent.model)]
+
     # ── --send 模式：发送一条消息然后退出 ──
     if len(sys.argv) > 2 and sys.argv[1] == "--send":
         asyncio.run(_send_and_exit(agent, sys.argv[2]))

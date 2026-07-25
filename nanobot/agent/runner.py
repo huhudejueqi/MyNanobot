@@ -358,6 +358,8 @@ class AgentRunner:
             if context.error is not None:
                 await hook.on_error(context)
             await hook.after_run(context)
+            # propagate hook final_content modifications (e.g. cost line)
+            result.final_content = context.final_content
             return result
         finally:
             context.messages = deepcopy(messages)

@@ -262,9 +262,8 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
                                 sys.stdout.flush()
                             continue
                         if meta.get("_streamed"):
-                            # 流式模式下内容已通过 _stream_delta 实时输出
-                            # 仅当未产生任何流式输出（如超时/错误）时，才兜底显示
-                            if not stream_started and msg.content:
+                            # 存给 Rich 渲染（流式时也存，确保终端可见）
+                            if msg.content:
                                 turn_content.append(msg.content)
                                 turn_metadata.update(meta)
                             turn_done.set()
@@ -292,11 +291,15 @@ async def run_cli(agent: AgentLoop, *, log_file: Path | None = None) -> None:
                 if turn_content:
                     from rich.console import Console
                     from rich.markdown import Markdown
-                    c = Console(file=sys.stdout)
-                    c.print()
-                    c.print("[cyan]🤖 MyNanobot[/cyan]")
-                    c.print(Markdown(turn_content[0]))
-                    c.print()
+                    c = Console(file=sys.stdout, force_terminal=True)
+                    with c.capture() as cap:
+                        c.print()
+                        c.print("[cyan]🤖 MyNanobot[/cyan]")
+                        c.print(Markdown(turn_content[0]))
+                        c.print()
+                    # raw 模式下 OPOST 被关闭，\n 不会自动转 \r\n，手工替换
+                    sys.stdout.write(cap.get().replace("\n", "\r\n"))
+                    sys.stdout.flush()
 
                 consumer.cancel()
                 try:
