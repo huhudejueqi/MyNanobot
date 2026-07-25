@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+# OutboundMessage.metadata 可选键，用于存放结构化、不依赖渠道的UI交互载荷
+OUTBOUND_META_AGENT_UI = "_agent_ui"
+
+# 仅内部使用的入站消息元数据标识，供进程内通信渠道使用
+INBOUND_META_RUNTIME_CONTROL = "_runtime_control"
+RUNTIME_CONTROL_ACK = "_ack"
+RUNTIME_CONTROL_MCP_RELOAD = "mcp_reload"
+
 
 @dataclass
 class InboundMessage:
@@ -16,11 +24,12 @@ class InboundMessage:
     timestamp: datetime = field(default_factory=datetime.now)
     media: list[str] = field(default_factory=list)        # 媒体资源 URL 列表
     metadata: dict[str, Any] = field(default_factory=dict)  # 扩展数据
+    session_key_override: str | None = None  # 可选：手动指定会话唯一标识
 
     @property
     def session_key(self) -> str:
         """会话唯一标识，默认按「频道:会话ID」拼接。"""
-        return f"{self.channel}:{self.chat_id}"
+        return self.session_key_override or f"{self.channel}:{self.chat_id}"
 
 
 @dataclass

@@ -194,6 +194,15 @@ def _apply_ssrf_whitelist(config: Config) -> None:
 
 # ---- 环境变量插值 ----
 
+def save_config(config: Config, config_path: Path | None = None) -> None:
+    """保存配置到文件。"""
+    path = config_path or get_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = config.model_dump(mode="json", by_alias=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
 _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 

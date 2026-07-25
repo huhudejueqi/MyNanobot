@@ -20,6 +20,7 @@ from collections.abc import Callable
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
+import logging
 
 # 强制 Windows 控制台使用 UTF-8 编码，避免中文乱码
 if sys.platform == "win32":
@@ -48,6 +49,24 @@ _log_handler_id = logger.add(
     colorize=None,
     filter=lambda record: record["extra"].setdefault("channel", "-") or True,
 )
+
+# 同时写文件到 ~/.nanobot/agent.log
+_log_file = Path.home() / ".nanobot" / "agent.log"
+_log_file.parent.mkdir(parents=True, exist_ok=True)
+_log_file_handler_id = logger.add(
+    str(_log_file),
+    level=os.environ.get("NANOBOT_LOG_LEVEL", "INFO"),
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} [{level}][{name}] {message}",
+    encoding="utf-8", rotation="10 MB", retention=3,
+)
+
+# 把标准 logging 的 nanobot.* 也导入 loguru 文件
+from nanobot.utils.logging_bridge import redirect_lib_logging
+_log_level = os.environ.get("NANOBOT_LOG_LEVEL", "INFO").upper()
+redirect_lib_logging("nanobot", level=_log_level)
+logging.getLogger("nanobot").setLevel(getattr(logging, _log_level, logging.INFO))
+redirect_lib_logging("httpx", level="WARNING")
+redirect_lib_logging("httpcore", level="WARNING")
 
 from prompt_toolkit import PromptSession, print_formatted_text  # noqa: E402
 from prompt_toolkit.application import run_in_terminal  # noqa: E402
@@ -709,10 +728,10 @@ def serve(
     api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
 
     async def on_startup(_app):
-        await agent_loop._connect_mcp()
+        pass  # MCP connect handled by AgentLoop internally
 
     async def on_cleanup(_app):
-        await agent_loop.close_mcp()
+        await agent_loop.stop()
 
     api_app.on_startup.append(on_startup)
     api_app.on_cleanup.append(on_cleanup)
@@ -779,7 +798,7 @@ def _run_gateway(
 
     port = port if port is not None else config.gateway.port
 
-    console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    console.print(f"{__logo__} Starting Mynanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     runtime_events = RuntimeEventBus()
@@ -1145,7 +1164,7 @@ def _run_gateway(
         try:
             await cron.start()
             tasks = [
-                agent.run(),
+                agent.run_forever(),
                 channels.start_all(),
             ]
             if health_server_enabled:
@@ -1161,9 +1180,8 @@ def _run_gateway(
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
-            await agent.close_mcp()
             cron.stop()
-            agent.stop()
+            await agent.stop()
             await channels.stop_all()
             # Flush all cached sessions to durable storage before exit.
             # This prevents data loss on filesystems with write-back
@@ -1286,7 +1304,7 @@ def agent(
                     metadata=response.metadata if response else None,
                     **print_kwargs,
                 )
-            await agent_loop.close_mcp()
+            await agent_loop.stop()
 
         asyncio.run(run_once())
     else:
@@ -1319,7 +1337,7 @@ def agent(
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
         async def run_interactive():
-            bus_task = asyncio.create_task(agent_loop.run())
+            bus_task = asyncio.create_task(agent_loop.run_forever())
             turn_done = asyncio.Event()
             turn_done.set()
             turn_response: list[tuple[str, dict]] = []
@@ -1433,10 +1451,9 @@ def agent(
                         console.print("\nGoodbye!")
                         break
             finally:
-                agent_loop.stop()
+                await agent_loop.stop()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
 

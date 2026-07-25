@@ -15,7 +15,6 @@ from typing import Any
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
-from nanobot.agent.tools.mcp import request_mcp_reload
 from nanobot.bus.queue import MessageBus
 from nanobot.webui.cli_apps_api import cli_apps_action, cli_apps_payload
 from nanobot.webui.http_utils import query_first as _query_first
@@ -154,6 +153,10 @@ class WebUISettingsRouter:
             runtime_capability_overrides=self._runtime_capabilities,
             restart_required_sections=sections,
         )
+
+async def _reload_mcp(bus):
+    from nanobot.agent.tools.mcp import request_mcp_reload
+    return await request_mcp_reload(bus)
 
     def _parse_mcp_settings_query(self, request: WsRequest) -> QueryParams:
         query = self._query(request)
@@ -348,7 +351,7 @@ class WebUISettingsRouter:
             payload = await mcp_presets_settings_action(
                 action,
                 self._parse_mcp_settings_query(request),
-                reload_mcp=lambda: request_mcp_reload(self.bus),
+                reload_mcp=lambda bus=self.bus: _reload_mcp(bus),
             )
         except Exception as e:
             status = getattr(e, "status", 500)

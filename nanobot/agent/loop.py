@@ -189,6 +189,7 @@ class _DebugHook(AgentHook):
 
 
 class AgentLoop:
+    on_llm_end = None  # Optional callback, set externally if needed
     """AgentLoop 是 MyNanobot 的核心处理引擎。
     状态机执行树：
                      消息到达 _dispatch()

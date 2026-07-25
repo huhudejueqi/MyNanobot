@@ -11,7 +11,12 @@ import uuid
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Self
+import sys
+from typing import Any
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self  # Python 3.10 compat
 
 from pydantic import Field, field_validator, model_validator
 from websockets.asyncio.server import ServerConnection, serve, unix_serve

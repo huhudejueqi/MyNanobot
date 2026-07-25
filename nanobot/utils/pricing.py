@@ -35,9 +35,10 @@ _MODEL_PRICES: list[tuple[str, float, float]] = [
     ("claude-3-haiku",        0.25,  1.25),
     ("claude-2",              8.00, 24.00),
     # -- DeepSeek ------------------------------------------------------------
-    ("deepseek-reasoner",     0.55,  2.19),
-    ("deepseek-chat",         0.27,  1.10),
-    ("deepseek-coder",        0.14,  0.28),
+    ("deepseek-v4-flash",     0.14,  0.28),
+    ("deepseek-v4-pro",       0.435, 0.87),
+    ("deepseek-reasoner",     0.55,  2.19),   # 即将弃用
+    ("deepseek-chat",         0.27,  1.10),   # 即将弃用
     # -- Google Gemini -------------------------------------------------------
     ("gemini-2.5-pro",        1.25, 10.00),
     ("gemini-2.0-flash",      0.10,  0.40),
@@ -104,8 +105,10 @@ _MODEL_CACHE_PRICES: list[tuple[str, float]] = [
     ("claude-3-sonnet",       0.30),
     ("claude-3-haiku",        0.025),
     # DeepSeek：缓存 ≈ 输入价 × 0.1
-    ("deepseek-reasoner",     0.055),
-    ("deepseek-chat",         0.027),
+    ("deepseek-v4-flash",     0.0028),
+    ("deepseek-v4-pro",       0.003625),
+    ("deepseek-reasoner",     0.055),   # 即将弃用
+    ("deepseek-chat",         0.027),   # 即将弃用
     # 智谱：缓存 ≈ 输入价 × 0.5
     ("glm-4-plus",            0.25),
     ("glm-4",                 0.05),
